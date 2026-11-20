@@ -20,25 +20,56 @@
 # Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA
 # 02110-1301 USA
 # -----------------------------------------------------------------------------
+from __future__ import annotations
 
-__all__ = ['Signal', 'Signals', 'FutureProgress', 'synchronized', 'singleton']
+__all__ = ['Signal', 'Signals', 'FutureProgress', 'synchronized', 'singleton', 'spawn']
 
+import asyncio
+import functools
+import inspect
 import logging
 import time
-import asyncio
-import inspect
-from functools import partial, wraps
+import weakref
+from collections.abc import Awaitable, Callable, Coroutine, Iterator
+from typing import Any, ParamSpec, TypeVar
 
 log = logging.getLogger('toolbox')
 
+P = ParamSpec('P')
+T = TypeVar('T')
+
+# Strong references to fire-and-forget tasks, so they aren't garbage
+# collected before they finish.  See the note in asyncio.create_task().
+_background_tasks: set[asyncio.Task[Any]] = set()
+
+
+def spawn(coro: Coroutine[Any, Any, T], *, name: str | None = None) -> asyncio.Task[T]:
+    """
+    Schedules a coroutine to run in the background on the running loop.
+
+    Unlike a bare ``asyncio.create_task()``, a reference to the task is held
+    until it completes, and any unhandled exception is logged rather than
+    silently discarded.
+    """
+    task = asyncio.get_running_loop().create_task(coro, name=name)
+    _background_tasks.add(task)
+    task.add_done_callback(_background_task_done)
+    return task
+
+
+def _background_task_done(task: asyncio.Task[Any]) -> None:
+    _background_tasks.discard(task)
+    if not task.cancelled() and task.exception() is not None:
+        log.error('background task %s failed', task.get_name(), exc_info=task.exception())
+
 
 class Signal:
-    __slots__ = '_callbacks', '_deferred_args', '_changed_cb', '_future'
-
     """
     Create a Signal object to which callbacks can be connected and later
     invoked in sequence when the Signal is emitted.
     """
+    __slots__ = '_callbacks', '_deferred_args', '_changed_cb', '_future'
+
     # Defines the maximum number of connections to a signal.  Attempting to
     # connect more than this many callbacks will trigger an exception.
     MAX_CONNECTIONS = 1000
@@ -47,22 +78,19 @@ class Signal:
     CONNECTED = 1
     DISCONNECTED = 2
 
-    def __init__(self, changed_cb=None):
+    def __init__(self, changed_cb: Callable[[Signal, int], Any] | None = None) -> None:
         """
         :param changed_cb: corresponds to the :attr:`~Signal.changed_cb` property.
-        :type changed_cb: callable
         """
-        super().__init__()
         if changed_cb and not callable(changed_cb):
             raise TypeError('changed_cb must be callable')
         self._changed_cb = changed_cb
-        self._callbacks = []
-        self._deferred_args = None
-        self._future = None
-
+        self._callbacks: list[functools.partial[Any]] = []
+        self._deferred_args: list[tuple[tuple[Any, ...], dict[str, Any]]] | None = None
+        self._future: asyncio.Future[Any] | None = None
 
     @property
-    def changed_cb(self):
+    def changed_cb(self) -> Callable[[Signal, int], Any] | None:
         """
         Callable to be invoked whenever a callback is connected to or
         disconnected from the Signal.
@@ -74,16 +102,14 @@ class Signal:
         """
         return self._changed_cb
 
-
     @changed_cb.setter
-    def changed_cb(self, callback):
+    def changed_cb(self, callback: Callable[[Signal, int], Any] | None) -> None:
         if callback and not callable(callback):
             raise TypeError('value must be callable')
         self._changed_cb = callback
 
-
     @property
-    def callbacks(self):
+    def callbacks(self) -> tuple[functools.partial[Any], ...]:
         """
         Tuple containing the callbacks connected to this signal.
 
@@ -92,131 +118,107 @@ class Signal:
         """
         return tuple(self._callbacks)
 
+    def __iter__(self) -> Iterator[functools.partial[Any]]:
+        return iter(self._callbacks)
 
-    def __iter__(self):
-        for cb in self._callbacks:
-            yield cb
-
-
-    def __len__(self):
+    def __len__(self) -> int:
         return len(self._callbacks)
 
-
-    def __bool__(self):
+    def __bool__(self) -> bool:
         return True
 
+    def __contains__(self, func: object) -> bool:
+        return any(cb.func == func for cb in self._callbacks)
 
-    def __contains__(self, func):
-        for cb in self._callbacks:
-            if cb.func == func:
-                return True
-        return False
-
-
-    def _connect(self, callback, args=(), kwargs={}, once=False, pos=-1):
+    def _connect(self, callback: Callable[..., Any], args: tuple[Any, ...] = (),
+                 kwargs: dict[str, Any] | None = None, once: bool = False, pos: int = -1) -> functools.partial[Any]:
         """
         Connects a new callback to the signal.  args and kwargs will be bound
         to the callback and merged with the args and kwargs passed during
-        emit().  If weak is True, a WeakCallable will be created.  If once is
-        True, the callback will be automatically disconnected after the next
-        emit().
-
-        This method returns the Callable (or WeakCallable) object created.
+        emit().  If once is True, the callback will be automatically
+        disconnected after the next emit().
         """
         if not callable(callback):
-            raise TypeError('callback must be callable, got %s instead.' % callback)
+            raise TypeError(f'callback must be callable, got {callback} instead.')
 
         if len(self._callbacks) >= Signal.MAX_CONNECTIONS:
-            raise ValueError('Number of callbacks exceeds Signal.MAX_CONNECTIONS limit (%d)' % Signal.MAX_CONNECTIONS)
+            raise ValueError(f'Number of callbacks exceeds Signal.MAX_CONNECTIONS limit ({Signal.MAX_CONNECTIONS})')
 
-        callback = partial(callback, *args, **kwargs)
-        callback._signal_once = once
+        partial = functools.partial(callback, *args, **(kwargs or {}))
+        partial._signal_once = once  # type: ignore[attr-defined]
 
         if pos == -1:
             pos = len(self._callbacks)
 
-        self._callbacks.insert(pos, callback)
+        self._callbacks.insert(pos, partial)
         self._changed(Signal.CONNECTED)
 
         if self._deferred_args:
             # Clear deferred args before emitting, in case callbacks do emit_deferred().
             deferred_args, self._deferred_args = self._deferred_args, None
-            for args, kwargs in deferred_args:
-                self.emit(*args, **kwargs)
+            for dargs, dkwargs in deferred_args:
+                self.emit(*dargs, **dkwargs)
 
-        return callback
+        return partial
 
-
-    def connect(self, callback, *args, **kwargs):
+    def connect(self, callback: Callable[..., Any], *args: Any, **kwargs: Any) -> functools.partial[Any]:
         """
         Connects the callback with the (optional) given arguments to be invoked
         when the signal is emitted.
 
-        :param callback: callable invoked when signal emits
-        :param args: optional non-keyword arguments passed to the callback
-        :param kwargs: optional keyword arguments passed to the callback.
         :return: a new :class:`functools.partial` object encapsulating the supplied
                  callable and arguments.
         """
         return self._connect(callback, args, kwargs)
 
-
-    def connect_once(self, callback, *args, **kwargs):
+    def connect_once(self, callback: Callable[..., Any], *args: Any, **kwargs: Any) -> functools.partial[Any]:
         """
         Variant of :meth:`~Signal.connect` where the callback is automatically
         disconnected after one signal emission.
         """
         return self._connect(callback, args, kwargs, once=True)
 
-
-    def connect_first(self, callback, *args, **kwargs):
+    def connect_first(self, callback: Callable[..., Any], *args: Any, **kwargs: Any) -> functools.partial[Any]:
         """
         Variant of :meth:`~Signal.connect` in which the given callback is
         inserted to the front of the callback list.
         """
         return self._connect(callback, args, kwargs, pos=0)
 
-
-    def connect_first_once(self, callback, *args, **kwargs):
+    def connect_first_once(self, callback: Callable[..., Any], *args: Any, **kwargs: Any) -> functools.partial[Any]:
         """
         Variant of :meth:`~Signal.connect_once` in which the given callback is
         inserted to the front of the callback list.
         """
         return self._connect(callback, args, kwargs, once=True, pos=0)
 
-
-    def _disconnect(self, callback, args, kwargs):
-        assert(callable(callback))
+    def _disconnect(self, callback: Callable[..., Any], args: tuple[Any, ...], kwargs: dict[str, Any]) -> int:
+        assert callable(callback)
         noargs = len(args) == len(kwargs) == 0
         new_callbacks = []
-        for cb in self._callbacks[:]:
+        for cb in self._callbacks:
             cbargs, cbkwargs = cb.args, cb.keywords or {}
             if (cb.func == callback and (noargs or (args, kwargs) == (cbargs, cbkwargs))) or cb == callback:
                 # This matches what we want to disconnect.
                 continue
             new_callbacks.append(cb)
 
-        num_removed = len(new_callbacks) - len(self._callbacks)
+        num_removed = len(self._callbacks) - len(new_callbacks)
         if num_removed:
             self._callbacks = new_callbacks
             self._changed(Signal.DISCONNECTED)
         return num_removed
 
-
-    def _changed(self, action):
+    def _changed(self, action: int) -> None:
         """
         Called when a callback was connected or disconnected.
 
         :param action: Signal.CONNECTED or Signal.DISCONNECTED
         """
         if self._changed_cb:
-            try:
-                self._changed_cb(self, action)
-            except CallableError:
-                self._changed_cb = None
+            self._changed_cb(self, action)
 
-
-    def disconnect(self, callback, *args, **kwargs):
+    def disconnect(self, callback: Callable[..., Any], *args: Any, **kwargs: Any) -> int:
         """
         Disconnects the given callback from the signal so that future emissions
         will not invoke that callback any longer.
@@ -232,8 +234,7 @@ class Signal:
         """
         return self._disconnect(callback, args, kwargs)
 
-
-    def disconnect_all(self):
+    def disconnect_all(self) -> None:
         """
         Disconnects all callbacks from the signal.
         """
@@ -242,24 +243,28 @@ class Signal:
         if count > 0:
             self._changed(Signal.DISCONNECTED)
 
-
-    def emit(self, *args, **kwargs):
+    def emit(self, *args: Any, **kwargs: Any) -> bool:
         """
         Emits the signal, passing the given arguments callback connected to the signal.
+
+        Callbacks may be coroutine functions, in which case the coroutine is
+        scheduled as a background task on the running loop.
 
         :return: False if any of the callbacks returned False, and True otherwise.
         """
         retval = True
-        if self._callbacks:
-            for cb in self._callbacks[:]:
-                if cb._signal_once:
-                    self.disconnect(cb)
+        for cb in self._callbacks[:]:
+            if cb._signal_once:  # type: ignore[attr-defined]
+                self.disconnect(cb)
 
-                try:
-                    if cb(*args, **kwargs) == False:
-                        retval = False
-                except Exception as e:
-                    log.exception('Exception while emitting signal')
+            try:
+                result = cb(*args, **kwargs)
+                if inspect.iscoroutine(result):
+                    spawn(result)
+                elif result is False:
+                    retval = False
+            except Exception:
+                log.exception('Exception while emitting signal')
 
         if self._future:
             if len(args) == 1:
@@ -273,8 +278,7 @@ class Signal:
 
         return retval
 
-
-    def emit_deferred(self, *args, **kwargs):
+    def emit_deferred(self, *args: Any, **kwargs: Any) -> None:
         """
         Queues the emission until after the next callback is connected.
 
@@ -287,19 +291,17 @@ class Signal:
         else:
             self._deferred_args.append((args, kwargs))
 
-
-    def emit_when_handled(self, *args, **kwargs):
+    def emit_when_handled(self, *args: Any, **kwargs: Any) -> bool | None:
         """
         Emits the signal if there are callbacks connected, or defers it until
         the first callback is connected.
         """
         if self.count():
             return self.emit(*args, **kwargs)
-        else:
-            self.emit_deferred(*args, **kwargs)
+        self.emit_deferred(*args, **kwargs)
+        return None
 
-
-    def count(self):
+    def count(self) -> int:
         """
         Returns the number of callbacks connected to the signal.
 
@@ -307,131 +309,85 @@ class Signal:
         """
         return len(self._callbacks)
 
-
-    def future(self):
+    def future(self) -> asyncio.Future[Any]:
         """
         Returns a Future object that is done when the signal next emits.
-
-        :return: a new :class:`~asyncio.Future' object
         """
         if not self._future:
-            self._future = asyncio.Future()
+            self._future = asyncio.get_running_loop().create_future()
         return self._future
 
 
-
-class Signals(dict):
+class Signals(dict[str, Signal]):
     """
-    A collection of one or more Signal objects, which behaves like a dictionary
-    (with key order preserved).
+    A collection of one or more Signal objects, which behaves like a dictionary.
 
     The initializer takes zero or more arguments, where each argument can be a:
         * dict (of name=Signal() pairs) or other Signals object
         * tuple/list of (name, Signal) tuples
         * str representing the name of the signal
     """
-    def __init__(self, *signals):
+    def __init__(self, *signals: dict[str, Signal] | tuple[str, Signal] | list[Any] | str) -> None:
         super().__init__()
-        # Preserve order of keys.
-        self._keys = []
         for s in signals:
             if isinstance(s, dict):
-                # parameter is a dict/Signals object
                 self.update(s)
-                self._keys.extend(s.keys())
             elif isinstance(s, str):
-                # parameter is a string
                 self[s] = Signal()
-                self._keys.append(s)
             elif isinstance(s, (tuple, list)) and len(s) == 2:
-                # In form (key, value)
-                if isinstance(s[0], basestring) and isinstance(s[1], Signal):
+                if isinstance(s[0], str) and isinstance(s[1], Signal):
                     self[s[0]] = s[1]
-                    self._keys.append(s[0])
                 else:
                     raise TypeError('With form (k, v), key must be string and v must be Signal')
-
             else:
-                # parameter is something else, bad
                 raise TypeError('signal key must be string')
 
-
-    def __delitem__(self, key):
-        super().__delitem__(key)
-        self._keys.remove(key)
-
-
-    def keys(self):
-        """
-        List of signal names (strings).
-        """
-        return self._keys
-
-
-    def values(self):
-        """
-        List of Signal objects.
-        """
-        return [self[k] for k in self._keys]
-
-
-    def __add__(self, signals):
+    def __add__(self, signals: Any) -> Signals:
         return Signals(self, *signals)
 
-
-    def add(self, *signals):
+    def add(self, *signals: Any) -> Signals:
         """
         Creates a new Signals object by merging all signals defined in
         self and the signals specified in the arguments.
-
-        The same types of arguments accepted by the initializer are allowed
-        here.
         """
         return Signals(self, *signals)
 
-
-    def subset(self, *names):
+    def subset(self, *names: str) -> Signals:
         """
         Returns a new Signals object by taking a subset of the supplied
         signal names.
-
-        The keys of the new Signals object are ordered as specified in the
-        names parameter.
-
-            >>> yield signals.subset('pass', 'fail').any()
         """
         return Signals(*[(k, self[k]) for k in names])
 
+    def futures(self) -> list[asyncio.Future[Any]]:
+        return [signal.future() for signal in self.values()]
 
-    def futures(self):
-        return [self[k].future() for k in self._keys]
+    async def any(self) -> tuple[set[asyncio.Future[Any]], set[asyncio.Future[Any]]]:
+        return await asyncio.wait(self.futures(), return_when=asyncio.FIRST_COMPLETED)
 
-
-    def any(self):
-        return asyncio.wait(self.futures(), return_when=asyncio.FIRST_COMPLETED)
-
-
-    def all(self, return_exceptions=True):
-        return asyncio.gather(*self.futures(), return_exceptions=return_exceptions)
-
-
-
-
+    async def all(self, return_exceptions: bool = True) -> list[Any]:
+        return await asyncio.gather(*self.futures(), return_exceptions=return_exceptions)
 
 
 class FutureProgress(Signal):
-    def __init__(self, max=0, interval=1):
+    """
+    Tracks the progress of some operation (e.g. a download).  The signal is
+    emitted (with the progress object as the argument) at most once per
+    ``interval`` seconds as progress is updated.
+    """
+    __slots__ = 'start_time', '_last_emit_time', '_last_pos', 'pos', 'max', 'interval', '_speed'
+
+    def __init__(self, max: float = 0, interval: float = 1) -> None:
         super().__init__()
-        self.start_time = time.time()
-        self._last_emit_time = 0
-        self._last_pos = None
-        self.pos = 0
+        self.start_time = time.monotonic()
+        self._last_emit_time = 0.0
+        self._last_pos: float | None = None
+        self.pos: float = 0
         self.max = max
         self.interval = interval
-        self._speed = None
+        self._speed: float | None = None
 
-
-    def set(self, pos=None, max=None, speed=None):
+    def set(self, pos: float | None = None, max: float | None = None, speed: float | None = None) -> None:
         """
         Set new status. The new status is pos of max.
         """
@@ -440,11 +396,11 @@ class FutureProgress(Signal):
         if pos is not None:
             self.pos = pos
         if self.pos > self.max:
-            self.max = pos
+            self.max = self.pos
         if speed is not None:
             self._speed = speed
 
-        now = time.time()
+        now = time.monotonic()
         interval = now - self._last_emit_time
         if interval > self.interval:
             if speed is None and self._last_pos is not None:
@@ -454,138 +410,106 @@ class FutureProgress(Signal):
             self._last_pos = self.pos
             self.emit(self)
 
-
-    def update(self, diff=1, speed=None):
+    def update(self, diff: float = 1, speed: float | None = None) -> None:
         """
         Update position by the given difference.
         """
         self.set(self.pos + diff, speed=speed)
 
-
-    def get_ascii_bar(self, width=70):
+    def get_ascii_bar(self, width: int = 70) -> str:
         """
         Return a small ASCII art progressbar.
         """
-        n = 0
-        if self.max:
-            n = int((self.pos / float(self.max)) * (width-3))
-        s = '|%%%ss|' % (width-2)
-        return s % ("="*n + ">").ljust(width-2)
-
+        n = int((self.pos / self.max) * (width - 3)) if self.max else 0
+        return '|' + ('=' * n + '>').ljust(width - 2) + '|'
 
     @property
-    def elapsed(self):
+    def elapsed(self) -> float:
         """
         Return time elapsed since the operation started.
         """
-        return time.time() - self.start_time
+        return time.monotonic() - self.start_time
 
     @property
-    def eta(self):
+    def eta(self) -> float:
         """
-        Estimated time left to complete the operation. Depends on the
-        operation itself if this is correct or not.
+        Estimated time left to complete the operation, assuming every step
+        takes the same amount of time.
         """
         if not self.pos:
             return 0
-        sec = (time.time() - self.start_time) / self.pos
-        # we assume every step takes the same amount of time
+        sec = self.elapsed / self.pos
         return sec * (self.max - self.pos)
 
     @property
-    def percentage(self):
+    def percentage(self) -> float:
         """
         Return percentage of steps done.
         """
-        if self.max:
-            return (self.pos * 100.0) / self.max
-        return 0
+        return (self.pos * 100.0) / self.max if self.max else 0
 
     @property
-    def speed(self):
+    def speed(self) -> float:
         """
         The current speed of the operation as set by :meth:`set` or
-        :meth:`update`.
-
-        This value has no predefined meaning.  It is up to the API to define
-        what units this value indicates.
+        :meth:`update`.  Units are up to the caller.
         """
         return self._speed or 0
 
 
-
-def synchronized(func):
+def synchronized(func: Callable[P, Awaitable[T]]) -> Callable[P, Coroutine[Any, Any, T]]:
     """
-    A decorator that synchronizes multiple invocations of a coroutine to
-    ensure they are executed sequentally rather than in parallel.
+    A decorator that synchronizes multiple invocations of a coroutine function
+    to ensure they are executed sequentially rather than in parallel.
     """
-    lock = asyncio.Lock()
-    @wraps(func)
-    def wrapper(*args, **kwargs):
-        with (yield from lock):
-            return (yield from func(*args, **kwargs))
+    # One lock per event loop, since asyncio primitives are bound to the loop
+    # they're first used with.
+    locks: weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, asyncio.Lock] = weakref.WeakKeyDictionary()
+
+    @functools.wraps(func)
+    async def wrapper(*args: P.args, **kwargs: P.kwargs) -> T:
+        lock = locks.setdefault(asyncio.get_running_loop(), asyncio.Lock())
+        async with lock:
+            return await func(*args, **kwargs)
     return wrapper
 
 
-def _singleton_coroutine(func):
-    task = None
-    @wraps(func)
-    def wrapper(*args, **kwargs):
-        nonlocal task
-        if task and not task.done():
-            return task
-        else:
-            loop = kwargs.get('loop') or asyncio.get_event_loop()
-            task = asyncio.Task(func(*args, **kwargs), loop=loop)
-            return task
-    return wrapper
-
-
-def _singleton_function(func):
-    handle = None
-
-    def dofunc(*args, **kwargs):
-        nonlocal handle
-        func(*args, **kwargs)
-        handle = None
-
-    @wraps(func)
-    def wrapper(*args, **kwargs):
-        nonlocal handle
-        if handle:
-            # Coalesce this call and return in-progress handle.
-            return handle
-        else:
-            loop = kwargs.get('loop', asyncio.get_event_loop())
-            handle = loop.call_soon(partial(dofunc, *args, **kwargs))
-            return handle
-
-    return wrapper
-
-
-def singleton(func):
+def singleton(func: Callable[P, Any]) -> Callable[P, Any]:
     """
     A decorator that ensures that only one active instance of the decorated
     function is allowed to exist at any given moment.
 
-    If the decorated function isn't a coroutine, then it is scheduled to be
-    called in the next event loop iteration.  This allows for multiple
-    invocations of the function to be coalesced into a single call.  In
-    this case, the returned value is a Handle object.
+    If the decorated function is a coroutine function, invoking it returns
+    the :class:`asyncio.Task` of the currently running instance, creating
+    one if none is active.  Concurrent callers therefore share the result of
+    a single invocation.
 
-    If the decorated function *is* a coroutine function, the return value is a
-    Task object of the currently running coroutine.
-
-    .. note::
-       Because invoking a function decorated with @singleton will cause a Task
-       object to be created, this should be decorated *after*
-       @asyncio.coroutine so that the Task object will not be created until
-       the coroutine is yielded from.
-
-    .. warning::
-       This decorator is not (yet) thread safe.
+    Otherwise the function is scheduled to be called in the next event loop
+    iteration, which allows multiple invocations to be coalesced into a
+    single call.  In this case, the returned value is a Handle object.
     """
-    if inspect.isgeneratorfunction(func) or asyncio.iscoroutinefunction(func):
-        return _singleton_coroutine(func)
-    else:
-        return _singleton_function(func)
+    if inspect.iscoroutinefunction(func):
+        task: asyncio.Task[Any] | None = None
+
+        @functools.wraps(func)
+        def coro_wrapper(*args: P.args, **kwargs: P.kwargs) -> asyncio.Task[Any]:
+            nonlocal task
+            if task is None or task.done():
+                task = spawn(func(*args, **kwargs), name=func.__qualname__)
+            return task
+        return coro_wrapper
+
+    handle: asyncio.Handle | None = None
+
+    def dofunc(*args: Any, **kwargs: Any) -> None:
+        nonlocal handle
+        handle = None
+        func(*args, **kwargs)
+
+    @functools.wraps(func)
+    def wrapper(*args: P.args, **kwargs: P.kwargs) -> asyncio.Handle:
+        nonlocal handle
+        if handle is None:
+            handle = asyncio.get_running_loop().call_soon(functools.partial(dofunc, *args, **kwargs))
+        return handle
+    return wrapper

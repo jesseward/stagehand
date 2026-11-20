@@ -1,26 +1,43 @@
-from __future__ import absolute_import
-import os
-import sys
-import time
-import logging
-import re
-import itertools
-import difflib
-from datetime import datetime, timedelta
+"""
+The local database of TV series and episodes, populated from the metadata
+providers.
+"""
+from __future__ import annotations
+
 import asyncio
+import difflib
+import functools
+import itertools
+import os
+import re
+from datetime import datetime, timedelta
+from enum import IntEnum
 
-from .toolbox import Signal, db, tostr, fsname, synchronized
-
-from .utils import fixsep, fixquotes, name_to_url_segment, remove_stop_words
 from .config import config
+from .logger import getLogger
+from .providers import ProviderError, plugins
 from .searchers import SearchResult
-from .providers import plugins, ProviderError
+from .toolbox import Signal, db, fsname, spawn, synchronized, tostr
+from .utils import fixquotes, fixsep, name_to_url_segment, remove_stop_words
 
-# get logging object
-log = logging.getLogger('stagehand.tvdb')
+log = getLogger('stagehand.tvdb')
 
-# XXX: testing python based ObjectRow
-#db.ObjectRow = db.PyObjectRow
+
+class EpisodeStatus(IntEnum):
+    NONE = 0
+    NEED = 1
+    HAVE = 2
+    # Fetch even if air date is unknown or in the future.
+    NEED_FORCED = 3
+    IGNORE = 4
+
+
+class SeriesStatus(IntEnum):
+    UNKNOWN = 0
+    RUNNING = 1
+    ENDED = 2
+    SUSPENDED = 3
+
 
 class Episode:
     """
@@ -64,13 +81,12 @@ class Episode:
         >>> ep.airdate, ep.code, ep.name
         (datetime.datetime(2009, 3, 5, 0, 0), 's05e16', u'Blood Drive')
     """
-    # Constants for episode status
-    STATUS_NONE = 0
-    STATUS_NEED = 1
-    STATUS_HAVE = 2
-    # Fetch even if air date is unknown or in the future.
-    STATUS_NEED_FORCED = 3
-    STATUS_IGNORE = 4
+    # Constants for episode status (aliases, for use in templates)
+    STATUS_NONE = EpisodeStatus.NONE
+    STATUS_NEED = EpisodeStatus.NEED
+    STATUS_HAVE = EpisodeStatus.HAVE
+    STATUS_NEED_FORCED = EpisodeStatus.NEED_FORCED
+    STATUS_IGNORE = EpisodeStatus.IGNORE
 
     def __init__(self, db, series, season, dbrow):
         super().__init__()
@@ -81,7 +97,7 @@ class Episode:
         self.season = season
 
     def __repr__(self):
-        return '<%s %s %s at 0x%x>' % (self.__class__.__name__, self.series.name, self.code, id(self))
+        return f'<{self.__class__.__name__} {self.series.name} {self.code} at 0x{id(self):x}>'
 
 
     def __eq__(self, other):
@@ -127,7 +143,7 @@ class Episode:
 
     @property
     def id(self):
-        return '%s:%s' % (self.series.provider.NAME, self.pid)
+        return f'{self.series.provider.NAME}:{self.pid}'
 
 
     @property
@@ -140,7 +156,7 @@ class Episode:
         """
         All provider ids for this episode.
         """
-        return ['%s:%s' % (p.NAME, self._dbattr(p.IDATTR)) for p in self.providers]
+        return [f'{p.NAME}:{self._dbattr(p.IDATTR)}' for p in self.providers]
 
     @property
     def name(self):
@@ -148,7 +164,7 @@ class Episode:
 
     @property
     def code(self):
-        return 's%02de%02d' % (self.season.number, self.number)
+        return f's{self.season.number:02d}e{self.number:02d}'
 
     @property
     def overview(self):
@@ -177,11 +193,11 @@ class Episode:
 
 
     @property
-    def status(self):
+    def status(self) -> EpisodeStatus:
         """
-        One of the STATUS_* constants.
+        The episode's status.
         """
-        return self._dbattr('status')
+        return EpisodeStatus(self._dbattr('status') or 0)
 
     @status.setter
     def status(self, value):
@@ -282,12 +298,12 @@ class Episode:
         # TODO: timezone
         airdatetime = self.airdatetime
         cutoff = datetime.now() - timedelta(days=days)
-        return airdatetime and datetime.now() >= airdatetime and self.airdatetime <= cutoff
+        return bool(airdatetime and datetime.now() >= airdatetime and airdatetime <= cutoff)
 
 
     def get_id_for_provider(self, name):
         for p in self.providers:
-            if p.NAME == name:
+            if name == p.NAME:
                 return self._dbattr(p.IDATTR)
         else:
             raise ValueError('invalid provider given')
@@ -310,7 +326,7 @@ class Season:
         self.number = season
 
     def __repr__(self):
-        return '<%s %s s%02d at 0x%x>' % (self.__class__.__name__, self.series.name, self.number, id(self))
+        return f'<{self.__class__.__name__} {self.series.name} s{self.number:02d} at 0x{id(self):x}>'
 
 
     def __eq__(self, other):
@@ -324,7 +340,7 @@ class Season:
 
 
     def __hash__(self):
-        return hash((Season, self.series._dbattr('id')), self.number)
+        return hash((Season, self.series._dbattr('id'), self.number))
 
 
     @property
@@ -349,7 +365,7 @@ class Season:
         # Get only rows from the preferred provider (provider id is not null) except
         # for season 0 (specials), where we take all episodes.
         if self.number > 0:
-            idmap = {self.series.provider.IDATTR: db.QExpr('>', u'')}
+            idmap = {self.series.provider.IDATTR: db.QExpr('>', '')}
         else:
             idmap = {}
         dbrows = self._db.query(type='episode', parent=self.series._dbrow, season=self.number, **idmap)
@@ -377,11 +393,11 @@ class Series:
     # There is a conflict but the user has acknowledged.
     CONFLICT_ACKED = 1
 
-    # Constants for status attribute
-    STATUS_UNKNOWN = 0
-    STATUS_RUNNING = 1
-    STATUS_ENDED = 2
-    STATUS_SUSPENDED = 3
+    # Constants for status attribute (aliases, for use in templates)
+    STATUS_UNKNOWN = SeriesStatus.UNKNOWN
+    STATUS_RUNNING = SeriesStatus.RUNNING
+    STATUS_ENDED = SeriesStatus.ENDED
+    STATUS_SUSPENDED = SeriesStatus.SUSPENDED
 
     def __init__(self, db, dbrow):
         super().__init__()
@@ -393,7 +409,7 @@ class Series:
         self._season_cache_ver = None
 
     def __repr__(self):
-        return '<%s %s at 0x%x>' % (self.__class__.__name__, self.name, id(self))
+        return f'<{self.__class__.__name__} {self.name} at 0x{id(self):x}>'
 
 
     def __eq__(self, other):
@@ -422,31 +438,29 @@ class Series:
         self._dbrow = self._db.get(self._dbrow)
 
     def get_conflicts(self):
-        pseries = dict((p, self._dbattr(p.CACHEATTR)) for p in self.providers if self._dbattr(p.CACHEATTR))
+        pseries = {p: self._dbattr(p.CACHEATTR) for p in self.providers if self._dbattr(p.CACHEATTR)}
         return self._db._get_conflicts(pseries)
 
-    @asyncio.coroutine
-    def change_provider(self, provider):
+    async def change_provider(self, provider):
         old = self.provider
         try:
             new = self._db.providers[provider] if isinstance(provider, str) else provider
         except KeyError:
-            raise ValueError('%s is not a known provider' % provider)
+            raise ValueError(f'{provider} is not a known provider') from None
         if old != new:
             # If the new provider isn't in the current list of series providers, then
             # ensure fast=False so we give the new provider an opportunity to be matched
             # to the current provider.
             fast = new in self.providers
             log.info('changing provider for %s (%s) from %s to %s (fast=%s)', self.id, self.name, old.NAME, new.NAME, fast)
-            yield from self._db._update_series(old, self._dbattr(old.IDATTR), dirty=[], preferred=new, fast=fast)
+            await self._db._update_series(old, self._dbattr(old.IDATTR), dirty=[], preferred=new, fast=fast)
 
 
-    @asyncio.coroutine
-    def refresh(self):
+    async def refresh(self):
         """
         Refreshes metadata from the series providers.
         """
-        yield from self._db._update_series(self.provider, self._dbattr(self.provider.IDATTR), dirty=self.providers)
+        await self._db._update_series(self.provider, self._dbattr(self.provider.IDATTR), dirty=self.providers)
 
 
     @property
@@ -476,7 +490,7 @@ class Series:
 
     @property
     def id(self):
-        return '%s:%s' % (self.provider.NAME, self.pid)
+        return f'{self.provider.NAME}:{self.pid}'
 
     @property
     def pid(self):
@@ -487,7 +501,7 @@ class Series:
         """
         All provider ids for this series.
         """
-        return ['%s:%s' % (p.NAME, self._dbattr(p.IDATTR)) for p in self.providers]
+        return [f'{p.NAME}:{self._dbattr(p.IDATTR)}' for p in self.providers]
 
     @property
     def conflict(self):
@@ -514,7 +528,7 @@ class Series:
         if not self._cfg:
             self._cfg = self._db.get_config_for_series(self.id)
             if not self._cfg:
-                raise AttributeError('Configuration for series id %s not found' % self.id)
+                raise AttributeError(f'Configuration for series id {self.id} not found')
         return self._cfg
 
 
@@ -532,8 +546,8 @@ class Series:
         return self._dbattr('imdbid')
 
     @property
-    def status(self):
-        return self._dbattr('status')
+    def status(self) -> SeriesStatus:
+        return SeriesStatus(self._dbattr('status') or 0)
 
     @property
     def overview(self):
@@ -603,7 +617,7 @@ class Series:
         if 'x' in code:
             # Convert NxM -> sNNeMM
             s, ep = code.split('x')
-            code = 's%02de%02d' % (int(s), int(ep))
+            code = f's{int(s):02d}e{int(ep):02d}'
         for ep in self.episodes:
             if ep.code == code:
                 return ep
@@ -611,22 +625,25 @@ class Series:
 
     def get_id_for_provider(self, name):
         for p in self.providers:
-            if p.NAME == name:
+            if name == p.NAME:
                 return self._dbattr(p.IDATTR)
         else:
             raise ValueError('invalid provider given')
 
 
-    def has_genre(self, *genres, **kwargs):
-        startswith = kwargs.get('startswith', True)
-        all = kwargs.get('all', False)
-        matches = []
+    def has_genre(self, *genres: str, startswith: bool = True, all: bool = False) -> bool:
+        """
+        Returns True if the series has any (or, if all is True, all) of the
+        given genres.  If startswith is True, a genre matches if it begins
+        with the requested genre.
+        """
+        matches = set()
         for requested in genres:
             requested = requested.lower()
             for genre in self.genres:
-                if startswith and genre.startswith(requested) or genre == requested:
-                    matches.append(requested)
-        return bool((all and len(matches) == len(genres)) or matches)
+                if (startswith and genre.startswith(requested)) or genre == requested:
+                    matches.add(requested)
+        return len(matches) == len(genres) if all else bool(matches)
 
 
 
@@ -638,13 +655,13 @@ class TVDB(db.Database):
     object has a preferred provider that takes precedence for episode
     numbering.
     """
-    def __init__(self, dbfile, *, loop=None):
+    def __init__(self, dbfile):
         super().__init__(dbfile, {
             # Module map for unpickler, conversion from python2 to python3.
             # Old objects in the database may use date objects from kaa which
             # are now obsoleted.
             'kaa.base.dateutils': 'stagehand.toolbox.dateutils'
-        }, loop=loop)
+        })
         self._version = 0
         self._series_cache = {}
         self._series_cache_list = []
@@ -696,7 +713,7 @@ class TVDB(db.Database):
         )
 
         self.lazy_commit = 5
-        self.providers = dict((name, p.Provider(self)) for name, p in plugins.items())
+        self.providers = {name: p.Provider(self) for name, p in plugins.items()}
         if not self.providers:
             raise RuntimeError('No TV metadata providers initialized successfully')
 
@@ -708,9 +725,9 @@ class TVDB(db.Database):
         try:
             name, pid = id.split(':', 1)
         except ValueError:
-            raise ValueError('id %s is not in the form provider:pid' % id)
+            raise ValueError(f'id {id} is not in the form provider:pid') from None
         if name not in self.providers:
-            raise ValueError('no such provider "%s"' % name)
+            raise ValueError(f'no such provider "{name}"')
         return self.providers[name], tostr(pid)
 
 
@@ -718,9 +735,11 @@ class TVDB(db.Database):
         if self._series_cache_ver == self._version:
             return
         cache = {}
+        # Reuse existing Series objects (keyed on database object id) so that
+        # references held elsewhere remain current.
+        existing = {s._dbrow['id']: s for s in self._series_cache.values()} if self._series_cache else {}
         for data in self.query(type='series'):
-            # Is this already in the series cache?
-            series = self._series_cache.get(data['id']) if self._series_cache else None
+            series = existing.get(data['id'])
             if not series:
                 series = Series(self, data)
             # See if any of the pids for this series are in the ignore list.
@@ -738,50 +757,37 @@ class TVDB(db.Database):
         self._series_cache_list = list(set(cache.values()))
 
 
-    @asyncio.coroutine
-    def _invoke_providers(self, method, *args, **kwargs):
+    async def _invoke_providers(self, method, *args, which=None, bubble=False, **kwargs):
         """
-        Invokes a method on all providers simultaenously, waits until all
+        Invokes a method on all providers simultaneously, waits until all
         are finished, and returns a list of 2-tuples (provider, results).
 
-        The 'which' kwarg is a list of providers to invoke the method on.
-        If which is a dict, then the key is the provider and the value is
-        the args to pass to the provider.
-
-        If not specified, the method will invoke on all providers.
+        :param which: the providers to invoke the method on.  If which is a
+                      dict, then the key is the provider and the value is the
+                      args to pass to the provider.  If not specified, the
+                      method will be invoked on all providers.
+        :param bubble: if True, an exception from any provider is raised;
+                       otherwise it is logged and that provider is omitted
+                       from the results.
         """
-        which = kwargs.pop('which', self.providers.values())
-        bubble = kwargs.pop('bubble', False)
+        if which is None:
+            which = list(self.providers.values())
         if isinstance(which, dict):
-            coroutines = [getattr(p, method)(*args) for p, args in which.items()]
-            which = which.keys()
+            calls = [(p, getattr(p, method)(*pargs)) for p, pargs in which.items()]
         else:
-            coroutines = [getattr(p, method)(*args, **kwargs) for p in which]
+            calls = [(p, getattr(p, method)(*args, **kwargs)) for p in which]
 
-        # Convert all the coroutines to Task objects and attach the providers
-        # to them, so we know for which provider the given task applied to, since
-        # the done list below may not be in the same order we passed.
-        tasks = []
-        for provider, coroutine in zip(which, coroutines):
-            task = asyncio.Task(coroutine)
-            task.provider = provider
-            tasks.append(task)
-
-        done, pending = yield from asyncio.wait(tasks)
-
-        # Remove exceptions from the results list and log them.
+        outcomes = await asyncio.gather(*(coro for _, coro in calls), return_exceptions=True)
         results = []
-        for task in done:
-            # Provider method could have raised an asynchronous exception,
-            # in which case accessing future.result() will raise.  If bubble is False
-            # (default) then we catch it and log it rather than letting it
-            # bubble up.
-            try:
-                results.append((task.provider, task.result()))
-            except Exception as e:
+        for (provider, _), outcome in zip(calls, outcomes, strict=True):
+            if isinstance(outcome, asyncio.CancelledError):
+                raise outcome
+            elif isinstance(outcome, BaseException):
                 if bubble:
-                    raise
-                log.exception('%s from provider %s failed', method, provider.NAME)
+                    raise outcome
+                log.error('%s from provider %s failed', method, provider.NAME, exc_info=outcome)
+            else:
+                results.append((provider, outcome))
         return results
 
 
@@ -805,7 +811,6 @@ class TVDB(db.Database):
         Given a name, remove stop words and non-word characters to construct a
         normalized string that represents an episode or series name.
         """
-        stopwords = 'the', 'a'
         if aggressive:
             # Remove anything in brackets.
             name = re.sub(r'\([^)]+\)', '', name)
@@ -1038,18 +1043,20 @@ class TVDB(db.Database):
         categorized = sum(len(eplist) for eplist in itertools.chain(matches.values(), conflicts.values())) + len(unmatched)
         # Raw count ignore eps with no name
         raw = sum(1 for series in pseries.values() for ep in series['episodes'] if ep['name'])
-        log.debug('n_real_conflicts=%d matches=%d conflicts=%d unmatched=%d max=%d categorized=%d raw=%d' % (n_real_conflicts, len(matches), len(conflicts), len(unmatched), n_episodes, categorized, raw))
+        log.debug('n_real_conflicts=%d matches=%d conflicts=%d unmatched=%d max=%d categorized=%d raw=%d',
+                  n_real_conflicts, len(matches), len(conflicts), len(unmatched), n_episodes, categorized, raw)
         if categorized != raw:
             alleps = list(itertools.chain(*[series['episodes'] for series in pseries.values()]))
-            log.error('_get_conflicts() lost episodes', len(alleps))
-            for eplist in matches.values() + conflicts.values():
+            log.error('_get_conflicts() lost episodes (categorized %d of %d)', categorized, raw)
+            for eplist in itertools.chain(matches.values(), conflicts.values()):
                 for p, ep in eplist:
                     try:
                         alleps.remove(ep)
                     except ValueError:
                         log.debug('not missing: %s', ep)
             for p, nn, ep in unmatched:
-                alleps.remove(ep)
+                if ep in alleps:
+                    alleps.remove(ep)
             for ep in alleps:
                 log.debug('missing: %s', ep)
 
@@ -1059,19 +1066,24 @@ class TVDB(db.Database):
 
     # Convenience methods used to track tasks for series updates.
 
-    def _track_update_task(self, provider, id, task):
-        series_id = '{}:{}'.format(provider.NAME, id)
-        if series_id in self._update_tasks_by_id:
+    def _track_update_task(self, provider, id, task, replace=False):
+        series_id = f'{provider.NAME}:{id}'
+        if not replace and series_id in self._update_tasks_by_id:
             log.warning('BUG: %s is unexpectedly active in _update_tasks_by_id', series_id)
         self._update_tasks_by_id[series_id] = task
 
 
     def _clear_update_task_by_id(self, provider, id):
         try:
-            del self._update_tasks_by_id['{}:{}'.format(provider.NAME, id)]
+            del self._update_tasks_by_id[f'{provider.NAME}:{id}']
         except KeyError:
             log.exception('failed to delete task')
-            pass
+
+
+    def _untrack_update_task(self, provider, id, task):
+        series_id = f'{provider.NAME}:{id}'
+        if self._update_tasks_by_id.get(series_id) is task:
+            del self._update_tasks_by_id[series_id]
 
 
     def _clear_update_task_by_series(self, series):
@@ -1092,16 +1104,15 @@ class TVDB(db.Database):
 
 
     @synchronized
-    @asyncio.coroutine
-    def _update_series(self, provider, id, dirty=[], preferred=None, fast=False, completed=None):
+    async def _update_series(self, provider, id, dirty=None, preferred=None, fast=False, completed=None):
         """
         Wraps _do_update_series() to keep track of per-series tasks.
 
         Needed in order to cancel active update tasks on delete.
         """
-        task = asyncio.Task(self._do_update_series(provider, id, dirty, preferred, fast, completed))
+        task = asyncio.create_task(self._do_update_series(provider, id, dirty, preferred, fast, completed))
         self._track_update_task(provider, id, task)
-        r = (yield from task)
+        r = await task
         if r is None:
             # If _do_update_series() returns None then we're done and can stop
             # tracking the task.  Otherwise it's because it spawned a new task to
@@ -1110,8 +1121,7 @@ class TVDB(db.Database):
         return r
 
 
-    @asyncio.coroutine
-    def _do_update_series(self, provider, id, dirty=[], preferred=None, fast=False, completed=None):
+    async def _do_update_series(self, provider, id, dirty=None, preferred=None, fast=False, completed=None):
         """
         Add or update a series with the local database, retrieving metadata from
         one or more providers as needed.
@@ -1134,7 +1144,8 @@ class TVDB(db.Database):
                   emitted once all work is complete.
         """
         log.debug('updating series %s:%s (fast=%s)', provider.NAME, id, fast)
-        assert(not isinstance(provider, str) and not isinstance(preferred, str))
+        dirty = list(dirty or ())
+        assert not isinstance(provider, str) and not isinstance(preferred, str)
 
         # Series dicts from providers, populated later.
         pseries = {}    # provider -> series dict
@@ -1177,7 +1188,7 @@ class TVDB(db.Database):
                 # Need to fetch series data for this provider.  This happens when
                 # there is no existing object, no cache for the provider, or the
                 # provider is in the dirty list.
-                pseries[provider] = yield from provider.get_series(id)
+                pseries[provider] = await provider.get_series(id)
                 del pids[provider]
                 if provider in dirty:
                     dirty.remove(provider)
@@ -1190,9 +1201,11 @@ class TVDB(db.Database):
                 # what we have now, call ourselves back with fast=False, and
                 # return back to the caller.
                 completed = Signal()
-                task = asyncio.Task(self._do_update_series(provider, id, dirty, fast=False, completed=completed))
-                # Replace tracked task with this new one
-                self._track_update_task(provider, id, task)
+                task = spawn(self._do_update_series(provider, id, dirty, fast=False, completed=completed))
+                # Replace tracked task with this new one, and stop tracking it
+                # once it's done.
+                self._track_update_task(provider, id, task, replace=True)
+                task.add_done_callback(functools.partial(self._untrack_update_task, provider, id))
                 # Generally, ip.finished won't be True, although this happens during testing
                 # where we used locally cached copies of series metadata, so coroutines
                 # don't need to yield on the network.
@@ -1200,12 +1213,6 @@ class TVDB(db.Database):
             else:
                 return None
 
-        # XXX:
-        if os.getenv('STAY_LOCAL', 0):
-            for zot in (u'73141', u'2594'), (u'79349', u'7926'), (u'75897', u'5266'), (u'73762', u'3741'), (u'95011', u'22622'), (u'73255', u'3908'), (u'73244', u'6061'), (u'71663', u'6190'), (u'164301', u'25189'):
-                if id in zot:
-                    missing=[]; pids = {self.providers['thetvdb']: zot[0], self.providers['tvrage']: zot[1]}
-                    break
         if missing:
             # We have providers we don't know the id for.  Do we know the series
             # name and start date?
@@ -1216,16 +1223,16 @@ class TVDB(db.Database):
                 # providers we need to get its name and start date.  If
                 # this fails we can't continue, so no point catching
                 # any exception get_series() raises.
-                pseries[provider] = s = yield from provider.get_series(id)
+                pseries[provider] = s = await provider.get_series(id)
                 name, started = s['name'], s['started']
                 # We just fetched it, so delete provider from pids.
                 del pids[provider]
 
             # Issue a search by name for all providers missing series ids.  First remove
             # any year or date in brackets from the name.
-            name = re.sub('\([\d-]+\)', '', name).strip()
+            name = re.sub(r'\([\d-]+\)', '', name).strip()
             log.info('searching for %s on provider(s) %s', name, ', '.join(p.NAME for p in missing))
-            for p, results in (yield from self._invoke_providers('search', name, which=missing)):
+            for p, results in (await self._invoke_providers('search', name, which=missing)):
                 normname = self._normalize_name(name)
                 normnameaggr = self._normalize_name(name, aggressive=True)
                 # List of series dicts that we consider a match
@@ -1255,7 +1262,7 @@ class TVDB(db.Database):
                             # If the aggressively normalized name matches and the start year
                             # matches, then add this to the maybe list for a more thorough
                             # comparison.
-                            if started[:4] == result.year:
+                            if started and started[:4] == result.year:
                                 maybe.append(result)
                                 break
                 if matches:
@@ -1267,7 +1274,7 @@ class TVDB(db.Database):
                     log.debug('no definitive matches for %s from %s, trying less likely options.', name, p.NAME)
                     for result in maybe:
                         log.debug('retrieving possible match %s (%s) from %s', result.name, result.id, p.NAME)
-                        s = yield from p.get_series(self._parse_id(result.id)[1])
+                        s = await p.get_series(self._parse_id(result.id)[1])
                         tpseries = dict(list(pseries.items()) + [(p, s)])
                         if not pseries and existing and preferred.CACHEATTR in existing:
                             # We have existing series data but pseries is empty, which means
@@ -1294,9 +1301,9 @@ class TVDB(db.Database):
 
         if pids:
             # We need to fetch series from the server.
-            which = dict((p, (sid,)) for p, sid in pids.items())
+            which = {p: (sid,) for p, sid in pids.items()}
             # FIXME: if some providers failed, we need a retry mechanism.
-            results = yield from self._invoke_providers('get_series', which=which)
+            results = await self._invoke_providers('get_series', which=which)
             if not results and not pseries:
                 # No results from server and no existing (cached) series dict.
                 # We're stuck.
@@ -1306,7 +1313,7 @@ class TVDB(db.Database):
                     pseries[p] = s
 
         if preferred not in pseries:
-            raise ProviderError('provider %s does not have series, unable to set as preferred' % preferred.NAME)
+            raise ProviderError(f'provider {preferred.NAME} does not have series, unable to set as preferred')
         self._update_db_with_pseries(pseries, preferred)
         if completed:
             self._clear_update_task_by_id(provider, id)
@@ -1335,7 +1342,7 @@ class TVDB(db.Database):
                     # the episode list.
                     episodes.extend(({p.IDATTR: ep['id']}, ep) for p, ep in eplist)
                 else:
-                    idmap = dict((p.IDATTR, ep['id']) for p, ep in eplist)
+                    idmap = {p.IDATTR: ep['id'] for p, ep in eplist}
                     # Merge all attributes from episodes, prioritizing the
                     # preferred provider if the attribute exists.
                     merged = {}
@@ -1349,12 +1356,11 @@ class TVDB(db.Database):
         else:
             # One provider, get all episodes with names.
             episodes = [({preferred.IDATTR: ep['id']}, ep) for ep in pseries[preferred]['episodes'] if ep['name']]
-            n_real_conflicts = 0
 
         # Store series dicts in the cache attributes for the providers, as well
         # as provider ids.
-        idmap = dict((p.IDATTR, s['id']) for p, s in pseries.items())
-        kwargs = dict((p.CACHEATTR, s) for p, s in pseries.items())
+        idmap = {p.IDATTR: s['id'] for p, s in pseries.items()}
+        kwargs = {p.CACHEATTR: s for p, s in pseries.items()}
         if 'banner_data' in pseries[preferred]:
             # XXX: banner_data from ANY provider if preferred has none
             # Banner data is not storted in the cache attributes.
@@ -1397,7 +1403,7 @@ class TVDB(db.Database):
         # orphaned rows.
         orphans = self.query(type='episode', parent=parent, id=db.QExpr('not in', dbids))
         for orphan in orphans:
-            epinfo = '%s s%02de%02d: %s' % (series['name'], orphan['season'], orphan['episode'], orphan['name'])
+            epinfo = '{} s{:02d}e{:02d}: {}'.format(series['name'], orphan['season'], orphan['episode'], orphan['name'])
             log.debug('removing orphaned entry for %s', epinfo)
             dupes = self.query(type='episode', parent=parent, id=db.QExpr('!=', orphan['id']),
                                season=orphan['season'], episode=orphan['episode'])
@@ -1458,18 +1464,16 @@ class TVDB(db.Database):
                 return series
 
 
-    @asyncio.coroutine
-    def search(self, name, provider='thetvdb'):
+    async def search(self, name, provider='thetvdb'):
         """
         Search for a series
         """
         which = [self.providers[provider]]
-        results = yield from self._invoke_providers('search', name, which=which, bubble=True)
-        return list(itertools.chain.from_iterable(l for p, l in results))
+        results = await self._invoke_providers('search', name, which=which, bubble=True)
+        return list(itertools.chain.from_iterable(rlist for p, rlist in results))
 
 
-    @asyncio.coroutine
-    def add_series_by_id(self, id, fast=True):
+    async def add_series_by_id(self, id, fast=True):
         """
         Adds the TV series specified by the provider id to the local database.
 
@@ -1494,7 +1498,7 @@ class TVDB(db.Database):
         series = self.query_one(type='series', **{provider.IDATTR: pid})
 
         if not series:
-            yield from self._update_series(provider, pid, fast=fast)
+            await self._update_series(provider, pid, fast=fast)
             series = self.query_one(type='series', **{provider.IDATTR: pid})
             if not series:
                 return
@@ -1503,8 +1507,7 @@ class TVDB(db.Database):
 
 
     @synchronized
-    @asyncio.coroutine
-    def sync(self, force=False):
+    async def sync(self, force=False):
         """
         Sync database with all metadata providers.
         """
@@ -1513,11 +1516,11 @@ class TVDB(db.Database):
         log.info('syncing with TV metadata providers')
         changed = {}  # series -> [provider, ...]
         self._build_series_cache()
-        for provider, ids in (yield from self._invoke_providers('get_changed_series_ids')):
+        for provider, ids in (await self._invoke_providers('get_changed_series_ids')):
             if not ids:
                 continue
             for id in ids:
-                series = self._series_cache.get('%s:%s' % (provider.NAME, id))
+                series = self._series_cache.get(f'{provider.NAME}:{id}')
                 if series:
                     changed.setdefault(series, []).append(provider)
 
@@ -1525,17 +1528,16 @@ class TVDB(db.Database):
         # (mine series cache for ids)
         for series, dirty in changed.items():
             log.info('refreshing "%s" for provider(s) %s', series.name, ', '.join(p.NAME for p in dirty))
-            yield from self._update_series(dirty[0], series._dbattr(dirty[0].IDATTR), dirty)
+            await self._update_series(dirty[0], series._dbattr(dirty[0].IDATTR), dirty)
         log.info('updated %d series from providers', len(changed))
         return len(changed)
 
 
-    @asyncio.coroutine
-    def add_series_by_search_result(self, result):
+    async def add_series_by_search_result(self, result):
         """
         Adds a new series given a SearchResult to the database.
         """
-        return (yield self.add_series_by_id(result.id))
+        return await self.add_series_by_id(result.id)
 
 
     def delete_series(self, series):
@@ -1582,7 +1584,7 @@ class TVDB(db.Database):
 
 
     def get_config_for_series(self, id=None, series=None):
-        assert(id or series)
+        assert id or series
         if not series:
             series = self._series_cache[id]
         for cfg in config.series:

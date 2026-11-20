@@ -1,0 +1,117 @@
+<h1>Add Series</h1>
+<table border='0' cellpadding='5' cellspacing='0' style='margin: 1em; font-family: Sans-serif'>
+<tbody id='step1'>
+<tr>
+    <td><span class='step'><span>1</span></span></td>
+    <td>Search for a TV series by name</td>
+</tr>
+<tr>
+    <td></td>
+    <td style='padding-bottom: 2em'>
+        <form id='search-form'>
+            <input type='search' id='series-name' size='25' required autofocus aria-label='Series name' />
+            &nbsp;
+            <button id='button-search'>Search</button>
+        </form>
+    </td>
+</tr>
+</tbody>
+
+<tbody id='step2'>
+<tr>
+    <td><span class='step'><span>2</span></span></td>
+    <td><span>Choose the series from the search results</span></td>
+</tr>
+<tr>
+    <td></td>
+    <td style='padding-bottom: 2em'>
+        <select id='select-series' style='min-width: 20em' aria-label='Search results'>
+            <option value='' disabled selected>Search for a series first</option>
+        </select>
+        <a href='/' id='select-series-link' hidden>
+            <img src='{{root}}/static/img/icon-16-thetvdb.png' alt='' style='margin: 0 0.4em 0 1em' />
+            View on TheTVDB.com
+        </a>
+        <div style='margin-top: 1em'>
+            <button id='button-add' type='button'><span aria-hidden='true'>+</span> Add Series</button>
+        </div>
+    </td>
+</tr>
+</tbody>
+
+<!--
+<tbody id='step3'>
+<tr>
+    <td><span class='step'><span>3</span></span></td>
+    <td><span>Configure settings for the series</span>
+</tr>
+<tr>
+    <td></td>
+    <td>
+        <div class='section'>
+        </div>
+    </td>
+</tr>
+</tbody>
+-->
+</table>
+<script>
+{
+    const step2 = $('#step2');
+    const menu = $('#select-series');
+    const addButton = $('#button-add');
+    const searchButton = $('#button-search');
+    const link = $('#select-series-link');
+    setDisabled(step2, true);
+
+    $('#search-form').addEventListener('submit', async event => {
+        event.preventDefault();
+        const name = $('#series-name').value.trim();
+        searchButton.disabled = true;
+        const note = toast({ title: 'Add TV Series', text: 'Searching for TV series ...', busy: true });
+        try {
+            const { results } = await stagehand.api('/api/shows/search', { data: { name } });
+            if (results.length === 0) {
+                note.update({ text: `No TV series were found matching "${name}"`, type: 'error', busy: false });
+                return;
+            }
+            note.close();
+            const placeholder = new Option('Choose a series ...', '', true, true);
+            placeholder.disabled = true;
+            menu.replaceChildren(placeholder,
+                ...results.map(r => new Option(`${r.name} (${r.started || '?'})`, r.id)));
+            setDisabled(step2, false);
+            addButton.disabled = true;
+            link.hidden = true;
+            menu.focus();
+        } catch (e) {
+            note.update({ text: `Unrecoverable error while searching (${e.message}).  Try again?`,
+                          type: 'error', busy: false });
+        } finally {
+            searchButton.disabled = false;
+        }
+    });
+
+    menu.addEventListener('change', () => {
+        addButton.disabled = !menu.value;
+        const [provider, id] = menu.value.split(':');
+        link.hidden = provider !== 'thetvdb';
+        link.href = `https://thetvdb.com/?tab=series&id=${encodeURIComponent(id)}&lid=7`;
+    });
+
+    addButton.addEventListener('click', async () => {
+        const id = menu.value;
+        addButton.disabled = true;
+        try {
+            await stagehand.api(`/api/shows/${encodeURIComponent(id)}`, { method: 'PUT' });
+            // Ids are "provider:number"; keep the colon readable in the URL.
+            window.location = `{{root}}/tv/${encodeURIComponent(id).replaceAll('%3A', ':')}`;
+        } catch (e) {
+            toast({ title: 'Add TV Series', text: `Failed to add series: ${e.message}`, type: 'error' });
+            addButton.disabled = false;
+        }
+    });
+}
+</script>
+
+%rebase('layout.tmpl', title='Add Series', section="tv", subsection="series")

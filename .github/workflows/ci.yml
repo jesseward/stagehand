@@ -1,0 +1,41 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # hatch-vcs derives the version from tags
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.15"
+          cache: pip
+      - run: pip install -e '.[dev]'
+      - run: ruff check stagehand tests
+      - run: mypy stagehand
+
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.15"
+          cache: pip
+      - name: Install ffprobe (for media verification tests)
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends ffmpeg
+      - run: pip install -e '.[dev,browser]'
+      - name: Install Chromium for browser tests
+        run: playwright install --with-deps chromium
+      - run: pytest --cov=stagehand --cov-report=term-missing:skip-covered

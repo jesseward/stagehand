@@ -1,0 +1,335 @@
+%from stagehand.toolbox.config import get_type
+%from stagehand.utils import cfgdesc2html, episode_status_icon_info
+
+%def header():
+    <style>
+        div.option {
+            display: inline-block;
+        }
+
+        #advanced {
+            width: 602px;
+            margin-top: 0.5em;
+        }
+
+        #advanced summary {
+            color: #888;
+            font-size: 80%;
+            cursor: pointer;
+            border-bottom: 1px solid #ddd;
+            padding: 0 0 0.2em 20px;
+        }
+
+        #advanced summary:hover {
+            text-decoration: underline;
+        }
+
+        #advanced-section {
+            border: 1px solid #ddd;
+            border-top: 0;
+            padding: 1em 0;
+            box-shadow: inset 20px 0 20px -15px #eee, inset -20px 0 20px -15px #eee;
+            background-color: #fdfdfd;
+            border-bottom-left-radius: 8px;
+            border-bottom-right-radius: 8px;
+        }
+
+        #episode-list {
+            z-index: 2;
+            position: relative;
+        }
+
+        tr.ep td:nth-child(1), tr.ep td:nth-child(2) {
+            padding: 0;
+        }
+
+        tr.ep td:nth-child(3) {
+            text-align: left;
+        }
+
+        tr.ep td:nth-child(4) {
+            white-space: nowrap;
+        }
+    </style>
+%end
+
+<h1>
+    <img id='status-icon-notpaused'
+        %if series.status == series.STATUS_RUNNING:
+            src='{{root}}/static/img/icon-16-play.png' alt='Running' title='Running'
+        %elif series.status == series.STATUS_SUSPENDED:
+            src='{{root}}/static/img/icon-16-pause.png' alt='Paused' title='Paused'
+        %elif series.status == series.STATUS_ENDED:
+            src='{{root}}/static/img/icon-16-stop.png' alt='Stopped' title='Stopped'
+        %end
+         {{'hidden' if series.cfg.paused else ''}} />
+    <img src='{{root}}/static/img/icon-16-pause.png' alt='Paused' title='Paused' id='status-icon-paused'
+         {{'' if series.cfg.paused else 'hidden'}} />
+    {{series.name}}
+</h1>
+<div class='section'>
+    %if series.banner_data:
+    <div style='text-align: left; padding: 0.5em 0'>
+        <a href='https://thetvdb.com/?tab=series&amp;id={{series.get_id_for_provider("thetvdb")}}&amp;lid=7'>
+            <img src='{{root}}/api/shows/{{series.id}}/banner' width='650' alt=''
+                 style='border: 1px solid black; max-height: 400px; width: auto' />
+        </a>
+    </div>
+    %end
+    <form id='series-settings'>
+        <div class='option'>
+            <label>Quality:</label>
+            <span class='segmented' role='radiogroup' aria-label='Quality'>
+            %for quality in get_type(series.cfg.quality):
+                <input type="radio" id="series-quality-{{quality}}" name='quality' value='{{quality}}'
+                      {{!'checked' if series.cfg.quality == quality else ''}} /><label
+                      for="series-quality-{{quality}}">{{quality}}</label>
+            %end
+            </span>
+            <div class='help'>{{!cfgdesc2html(series.cfg.quality)}}</div>
+        </div>
+        <br />
+
+        <div class='option'>
+            <label for='series-flat'>Flatten Seasons:</label>
+            <input type='checkbox' class='switch yesno' name='flat' id='series-flat'
+                  {{'checked' if series.cfg.flat else ''}} />
+            <div class='help'>{{!cfgdesc2html(series.cfg.flat)}}</div>
+        </div>
+        <br />
+
+        <div class='option'>
+            <label for='series-paused'>Downloads Paused:</label>
+            <input type='checkbox' class='switch yesno' name='paused' id='series-paused'
+                  {{'checked' if series.cfg.paused else ''}} />
+            <div class='help'>{{!cfgdesc2html(series.cfg.paused)}}</div>
+        </div>
+        <br />
+
+        <details id='advanced'>
+            <summary>Advanced Options</summary>
+            <div id='advanced-section'>
+                <div class='option'>
+                    <label>Episode Identifier:</label>
+                    %labels = {'epcode': 'Episode Code', 'date': 'Air Date'}
+                    <span class='segmented' role='radiogroup' aria-label='Episode identifier'>
+                    %for identifier in get_type(series.cfg.identifier):
+                        <input type="radio" id="series-identifier-{{identifier}}" name='identifier' value='{{identifier}}'
+                              {{!'checked' if series.cfg.identifier == identifier else ''}} /><label
+                              for="series-identifier-{{identifier}}">{{labels[identifier]}}</label>
+                    %end
+                    </span>
+                    <div class='help'>{{!cfgdesc2html(series.cfg.identifier)}}</div>
+                </div>
+                <br />
+
+                <div class='option'>
+                    <label for='series-path'>Directory Name:</label>
+                    <input type='text' id='series-path' name='path' size='25' value='{{series.cfg.path}}' />
+                    <div class='help'>{{!cfgdesc2html(series.cfg.path)}}</div>
+                </div>
+                <br />
+
+                <div class='option'>
+                    <label for='series-search-string'>Search String:</label>
+                    <input type='text' id='series-search-string' name='search_string' size='25'
+                           value='{{series.cfg.search_string}}' />
+                    <div class='help'>{{!cfgdesc2html(series.cfg.search_string)}}</div>
+                </div>
+                <br />
+
+                <div class='option'>
+                    <label for='series-language'>Language Code:</label>
+                    <input type='text' id='series-language' name='language' size='25' value='{{series.cfg.language}}' />
+                    <div class='help'>{{!cfgdesc2html(series.cfg.language)}}</div>
+                </div>
+                <br />
+
+                <div class='option' id='providers-list'>
+                    <label>Provider:</label>
+                    <span class='segmented' role='radiogroup' aria-label='Provider'>
+                    %for p in sorted(providers, key=lambda p: p.NAME):
+                        <input type="radio" id="provider-{{p.NAME}}" name='provider' value='{{p.NAME}}'
+                               {{'checked' if p == series.provider else ''}} /><label
+                               for="provider-{{p.NAME}}">{{p.NAME_PRINTABLE}}</label>
+                    %end
+                    </span>
+                    <div class='help'>{{!cfgdesc2html(series.cfg.provider)}}</div>
+                </div>
+                <br />
+            </div>
+        </details>
+    </form>
+
+    <div style='margin-top: 1.5em'>
+        <button type='button' id='button-refresh'><span aria-hidden='true'>↻</span> Refresh Episode Info</button>
+        <button type='button' id='button-delete' class='danger'>Delete Series</button>
+        <button type='button' id='button-search'>Download Needed Episodes Now</button>
+    </div>
+</div>
+
+%include('tv/download-needed-episodes.tmpl', root=root, buttonid='button-search', showid=series.id)
+
+
+
+<h1>Episodes</h1>
+<div style='padding: 0 64px; display: table; margin: 2em auto'>
+
+<div style='clear: both; padding-top: 0.75em'></div>
+
+%include('tv/episode-table-multiselect.tmpl', tableid='episode-list', root=root)
+
+<table id='episode-list' class='grid align-center interactive' width='100%'>
+<thead id='episode-list-header'>
+<tr>
+    <th style='padding: 0 0.7em'><input type='checkbox' /></th>
+    <th style='padding: 0 0.7em'>#</th>
+    <th style='text-align: left'>Name</th>
+    <th>Date</th>
+    <th>Status</th>
+</tr>
+</thead>
+<tbody>
+%season = 0
+%for ep in sorted(series.episodes, key=lambda e: (-e.season.number, -e.number)):
+    %if ep.season.number != season:
+        %season = ep.season.number
+        <tr class='heading' id='group-{{season}}'>
+            <td style='padding: 0'><input type='checkbox' /></td>
+            <td colspan="4" style='text-align: left; padding-left: 0.5em'>
+                %if ep.season.number == 0:
+                    <b>Specials</b>
+                %else:
+                    <b>Season {{ep.season.number}}</b>
+                %end
+            </td>
+        </tr>
+    %end
+    <tr id='{{series.id}}-{{ep.code}}' class='group-{{season}} ep'>
+        <td><input type='checkbox' /></td>
+        <td>{{ep.number}}</td>
+        <td>{{ep.name}}</td>
+        <td>
+            %if ep.airdate:
+                {{ep.airdate.strftime('%Y-%m-%d')}}
+            %else:
+                Not aired
+            %end
+        </td>
+        <td>
+            %icon, title = episode_status_icon_info(ep)
+            <img src='{{root}}/static/img/icon-20-status-{{icon}}.png' alt='{{title}}' title='{{title}}' />
+        </td>
+    </tr>
+%end
+</tbody>
+</table>
+</div>
+
+<script>
+{
+    const seriesId = '{{series.id}}';
+    const api = (path, options) => stagehand.api(`/api/shows/${seriesId}${path}`, options);
+    const form = $('#series-settings');
+
+    // Save settings whenever they change (except the provider, below).
+    form.addEventListener('change', async event => {
+        if (event.target.name === 'provider') {
+            return;
+        }
+        const data = {
+            quality: form.elements.quality.value,
+            path: form.elements.path.value,
+            search_string: form.elements.search_string.value,
+            language: form.elements.language.value,
+            paused: form.elements.paused.checked,
+            flat: form.elements.flat.checked,
+            identifier: form.elements.identifier.value,
+        };
+        try {
+            await api('/settings', { data, method: 'POST' });
+        } catch (e) {
+            toast({ title: 'Series settings', text: `Error while saving changes: ${e.message}`, type: 'error' });
+        }
+    });
+    form.addEventListener('submit', event => event.preventDefault());
+
+    $('#series-paused').addEventListener('change', event => {
+        $('#status-icon-notpaused').hidden = event.target.checked;
+        $('#status-icon-paused').hidden = !event.target.checked;
+    });
+
+    for (const radio of $$('#providers-list input')) {
+        radio.addEventListener('change', async () => {
+            const note = toast({ title: 'Series provider', text: 'Changing provider ...', busy: true });
+            try {
+                await api('/provider', { data: { provider: radio.value }, method: 'POST' });
+                window.location.reload();
+            } catch (e) {
+                note.update({ text: `Failed to change provider: ${e.message}`, type: 'error', busy: false });
+            }
+        });
+    }
+
+    $('#button-delete').addEventListener('click', async () => {
+        const confirmed = await confirmDialog({
+            title: 'Delete this series?',
+            text: 'This series will be permanently deleted from the local database, however no ' +
+                  'video files will be deleted.  Are you sure you want to do this?',
+            confirm: 'Delete series',
+        });
+        if (!confirmed) {
+            return;
+        }
+        try {
+            await api('', { method: 'DELETE' });
+            window.location = '{{root}}/tv/';
+        } catch (e) {
+            toast({ title: 'Series deletion failed', text: `Deletion failed with the error: ${e.message}`,
+                    type: 'error', sticky: true });
+        }
+    });
+
+    $('#button-refresh').addEventListener('click', async event => {
+        const button = event.currentTarget;
+        button.disabled = true;
+        const note = toast({ title: 'Refreshing Episode Info', text: 'Fetching series metadata from providers ...',
+                             busy: true });
+        try {
+            await api('/refresh', { method: 'POST' });
+            window.location.reload();
+        } catch (e) {
+            note.update({ text: `Refresh failed: ${e.message}`, type: 'error', busy: false });
+            button.disabled = false;
+        }
+    });
+
+    // Clicking an episode shows its overview.
+    let tipRow = null;
+    for (const row of $$('#episode-list tr.ep')) {
+        row.addEventListener('click', async () => {
+            if (tipRow === row) {
+                hideTip();
+                tipRow = null;
+                return;
+            }
+            tipRow = row;
+            const code = row.id.slice(seriesId.length + 1);
+            const { overview } = await api(`/${code}/overview`);
+            if (tipRow === row) {
+                showTip(row, escapeHTML(stripTags(overview) || 'No overview available.'), 'below');
+            }
+        });
+    }
+    document.addEventListener('click', event => {
+        if (tipRow && !tipRow.contains(event.target)) {
+            hideTip();
+            tipRow = null;
+        }
+    });
+
+    tooltip($$('.option').filter(o => $('.help', o)), option => $('.help', option).innerHTML, { delay: 300 });
+}
+</script>
+
+%rebase('layout.tmpl', title=series.name, section="tv", subsection="library", header=header)

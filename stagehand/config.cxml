@@ -239,11 +239,5 @@
         </list>
     </group>
 
-    <code>
-        # Force plugins to load and attach their config objects.
-        from . import searchers
-        from . import retrievers
-        from . import notifiers
-    </code>
 </config>
 

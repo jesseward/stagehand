@@ -1,0 +1,81 @@
+<div id='episode-button-bar' role='toolbar' aria-label='Change status of selected episodes'>
+    <button type='button' title='Schedule for download' data-status='need'>
+        <img src='{{root}}/static/img/icon-20-status-need.png' alt='Schedule for download' />
+    </button>
+    <button type='button' title='Ignore episodes' data-status='ignore'>
+        <img src='{{root}}/static/img/icon-20-status-ignore.png' alt='Ignore episodes' />
+    </button>
+    <button type='button' title='Delete downloaded files then ignore' data-status='delete'>
+        <img src='{{root}}/static/img/icon-16-delete.png' alt='Delete downloaded files then ignore' />
+    </button>
+</div>
+<script>
+ready(() => {
+    const table = $('#{{tableid}}');
+    const bar = $('#episode-button-bar');
+    const checkboxes = () => $$('input[type=checkbox]', table);
+
+    // The button bar slides out from behind the table while any episodes
+    // are selected.
+    const updateBar = () => bar.classList.toggle('open', checkboxes().some(c => c.checked));
+
+    table.addEventListener('change', event => {
+        const box = event.target;
+        if (box.type !== 'checkbox') {
+            return;
+        }
+        const row = box.closest('tr');
+        if (row.parentElement.tagName === 'THEAD') {
+            // Header checkbox selects everything.
+            checkboxes().forEach(c => c.checked = box.checked);
+        } else if (row.classList.contains('heading')) {
+            // Group heading selects the group.
+            $$(`tr.${CSS.escape(row.id)} input[type=checkbox]`, table).forEach(c => c.checked = box.checked);
+        }
+        updateBar();
+    });
+    // Clicking a checkbox shouldn't trigger the row's own click action.
+    table.addEventListener('click', event => {
+        if (event.target.type === 'checkbox') {
+            event.stopPropagation();
+        }
+    }, true);
+    checkboxes().forEach(c => c.checked = false);
+    updateBar();
+
+    // Keep the bar in view while scrolling down the table.
+    const barTop = bar.getBoundingClientRect().top + window.scrollY - 40;
+    const onScroll = () => bar.classList.toggle('stuck', window.scrollY > barTop);
+    window.addEventListener('scroll', onScroll, { passive: true });
+    onScroll();
+
+    for (const button of $$('button', bar)) {
+        button.addEventListener('click', async () => {
+            const status = button.dataset.status;
+            const byShow = new Map();
+            for (const box of $$('tr.ep input[type=checkbox]:checked', table)) {
+                // Row ids are "<showid>-<epcode>", and show ids contain no dashes.
+                const [showid, epcode] = box.closest('tr').id.split('-');
+                byShow.set(showid, [...(byShow.get(showid) ?? []), epcode]);
+            }
+            for (const [showid, codes] of byShow) {
+                try {
+                    const { statuses } = await stagehand.api(
+                        `/api/shows/${showid}/episodes/${codes.join(',')}/status?value=${status}`, { method: 'POST' });
+                    for (const [code, [icon, title]] of Object.entries(statuses)) {
+                        const img = document.getElementById(`${showid}-${code}`)?.querySelector('td:last-child img');
+                        if (img) {
+                            Object.assign(img, { src: `{{root}}/static/img/icon-20-status-${icon}.png`, title, alt: title });
+                        }
+                    }
+                } catch (e) {
+                    toast({ title: 'Episode status', text: `Failed to change episode status: ${e.message}`,
+                            type: 'error', sticky: true });
+                }
+            }
+            checkboxes().forEach(c => c.checked = false);
+            updateBar();
+        });
+    }
+});
+</script>

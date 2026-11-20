@@ -1,18 +1,20 @@
+from __future__ import annotations
+
+import logging
 import os
 import re
-import logging
-import asyncio
+from typing import TYPE_CHECKING, ClassVar
 
-# Make kaa.metadata optional (for now)
-try:
-    import metadata
-except ImportError:
-    metadata = None
-
+from .. import media
 from ..config import config
 
+if TYPE_CHECKING:
+    from ..searchers.base import SearchResult
+    from ..toolbox import FutureProgress
+    from ..tvdb import Episode
 
 log = logging.getLogger('stagehand.retrievers')
+
 
 class RetrieverError(Exception):
     pass
@@ -32,7 +34,6 @@ class RetrieverHardError(RetrieverError):
     result but with the retriever itself or its configuration (e.g. invalid
     credentials). No other search results for this retriever should be tried.
     """
-    pass
 
 
 class RetrieverAborted(RetrieverError):
@@ -41,11 +42,10 @@ class RetrieverAborted(RetrieverError):
 
 class RetrieverAbortedSoft(RetrieverAborted, RetrieverSoftError):
     """
-    A retrieve() InProgress may be aborted with this exception to abort the
-    retrieval of the active search result.  If there are other search results
-    for the episode being downloaded, they will be tried.
+    Raised when the retrieval of the active search result was aborted.  If
+    there are other search results for the episode being downloaded, they
+    will be tried.
     """
-    pass
 
 
 class RetrieverAbortedHard(RetrieverAborted, RetrieverHardError):
@@ -53,99 +53,105 @@ class RetrieverAbortedHard(RetrieverAborted, RetrieverHardError):
     Like RetrieverAbortedSoft, except no further results will be tried for the
     episode.
     """
-    pass
+
+
+# Minimum video height (inclusive) and maximum height (inclusive, or None for
+# no maximum) for each quality level.
+QUALITY_HEIGHTS: dict[str, tuple[int, int | None]] = {
+    'SD': (240, 540),
+    'HD': (600, None),
+    'UHD': (1600, None),
+}
+
+# Files shorter than this many seconds are rejected.
+MIN_DURATION = 300
+
+# If the file can't be identified after this many bytes, give up.
+MAX_UNIDENTIFIED_BYTES = 10 * 1024 * 1024
 
 
 class RetrieverBase:
     # Values must be populated by subclasses.
     # The internal name of the plugin (lowercase, no spaces).
-    NAME = None
+    NAME: ClassVar[str]
     # The human-readable name for the plugin.
-    PRINTABLE_NAME = None
+    PRINTABLE_NAME: ClassVar[str]
     # A list of supported types the retriever plugins supports (e.g. http, nzb,
     # torrent).
-    SUPPORTED_TYPES = ()
+    SUPPORTED_TYPES: ClassVar[tuple[str, ...]] = ()
     # False if the user may disable the plugin, or True if it is always active.
-    ALWAYS_ENABLED = False
+    ALWAYS_ENABLED: ClassVar[bool] = False
 
-    def __init__(self, loop=None):
-        super().__init__()
-        self._loop = loop or asyncio.get_event_loop()
-
-
-    @asyncio.coroutine
-    def _retrieve(self, progress, episode, result, outfile):
+    async def _retrieve(self, progress: FutureProgress, episode: Episode, result: SearchResult,
+                        outfile: str) -> None:
         """
-        Retrieve the given SearchResult object.
+        Retrieve the given SearchResult object.  Subclasses must implement.
         """
         raise NotImplementedError
 
+    async def retrieve(self, progress: FutureProgress, episode: Episode, result: SearchResult,
+                       outfile: str) -> None:
+        await self._retrieve(progress, episode, result, outfile)
 
-    def retrieve(self, progress, episode, result, outfile):
-        return self._retrieve(progress, episode, result, outfile)
-
-
-    def verify_result_file(self, episode, result, outfile):
+    async def verify_result_file(self, episode: Episode, result: SearchResult, outfile: str) -> bool | None:
         """
-        Ensure the given video file matches the user-requested criteria with
-        respect to resolution, codec, etc.
+        Ensure the given (possibly partial) video file matches the
+        user-requested criteria with respect to resolution, duration, and
+        audio language.
 
-        :returns: False if the file could not be parsed, or True if result is verified.
-        :raises: RetrieverError if the video file was valid did not pass
+        :returns: True if result is verified, False if the file could not be
+                  identified (yet), or None if verification isn't possible
+                  because ffprobe isn't installed.
+        :raises: RetrieverError if the video file was valid but did not pass
                  verification, which will cause the transfer to abort
         """
-        if not metadata:
-            log.warning('kaa.metadata module not available; skipping file verification')
-            return
-        info = metadata.parse(outfile)
+        if not media.ffprobe_path():
+            log.warning('ffprobe not available; skipping file verification')
+            return None
+
+        info = await media.probe(outfile)
         if not info:
-            if os.path.getsize(outfile) > 1024*1024*10:
+            if os.path.getsize(outfile) > MAX_UNIDENTIFIED_BYTES:
                 # We have 10MB of the file and still can't parse it.  Consider
                 # it corrupt or unknown.
                 raise RetrieverError('could not identify file after 10MB')
             return False
-        if info.media != 'MEDIA_AV':
-            raise RetrieverError('file is not a video file (is %s)' % info.media)
-        elif not info.video:
+        if not info.video:
             raise RetrieverError('file has no video tracks')
 
         # Find the video track with the highest (y) resolution.
-        # TODO: don't hardcode these
-        video = sorted(info.video, key=lambda track: track.height)[-1]
-        if (result.quality == 'SD' and (video.height < 240 or video.height > 540)) or \
-           (result.quality == 'HD' and video.height < 600) or \
-           (result.quality == 'UHD' and video.height < 1600):
-            raise RetrieverError('video resolution %dx%d does not satisfy requested %s quality' % \
-                                 (video.width, video.height, result.quality))
+        video = max(info.video, key=lambda track: track.height)
+        if result.quality in QUALITY_HEIGHTS:
+            lo, hi = QUALITY_HEIGHTS[result.quality]
+            if video.height < lo or (hi is not None and video.height > hi):
+                raise RetrieverError(f'video resolution {video.width}x{video.height} does not satisfy '
+                                     f'requested {result.quality} quality')
 
-        if info.length < 300:
-            raise RetrieverError('file duration %s is not long enough' % info.length)
+        if info.duration is not None and info.duration < MIN_DURATION:
+            raise RetrieverError(f'file duration {info.duration} is not long enough')
 
         # See if the audio is the right language.  If the language is specified in any of
         # the tracks, make sure one of them is the user-preferred language.
-        langs = set(track.langcode or 'und' for track in info.audio)
-        if langs == set(['und']):
+        langs = {track.language or 'und' for track in info.audio}
+        if langs <= {'und'}:
             # No languages specified in any track. Disqualify if 'dubbed' appears in
             # the result filename.
             if re.search(r'\bdubbed\b', result.filename, re.I):
                 raise RetrieverError('filename indicates dubbed audio but no language codes specified')
         else:
-            lang2to3 = dict((c[1], c[0]) for c in metadata.language.codes if len(c) == 3)
-            lang = episode.series.cfg.language or config.misc.language
-            threecode = lang2to3.get(lang) if len(lang) == 2 else lang
-            log.info('looking for preferred audio track language %s (%s)', threecode, lang)
-            if (not threecode or threecode not in langs) and lang not in langs:
+            lang = str(episode.series.cfg.language or config.misc.language)
+            wanted = media.language_codes(lang)
+            log.info('looking for preferred audio track language %s', lang)
+            if not wanted & langs:
                 # There are audio tracks with defined languages, but none of
                 # them are the language we want.  Heuristic (based on real
                 # world content): if the desired language is English and one
                 # of the tracks is undefined, assume it's English.
-                if threecode == 'eng' and 'und' in langs:
+                if 'eng' in wanted and 'und' in langs:
                     log.warning("no English track found, but assuming 'und' track is English")
                 else:
-                    raise RetrieverError('no %s audio track in file' % threecode)
+                    raise RetrieverError(f'no {lang} audio track in file')
 
-        # TODO: verify codecs too
-        log.debug('%s looks good (%dx%d %s, audio languages: %s)', result.filename, video.width, video.height, video.codec,
-                  ', '.join(langs))
-
+        log.debug('%s looks good (%dx%d %s, audio languages: %s)', result.filename, video.width, video.height,
+                  video.codec, ', '.join(sorted(langs)))
         return True

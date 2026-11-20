@@ -1,17 +1,19 @@
-import asyncio
+from __future__ import annotations
+
+from collections.abc import Sequence
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from ..tvdb import Episode
+
 
 class NotifierError(Exception):
     pass
 
+
 class NotifierBase:
-    def __init__(self, loop=None):
-        super().__init__()
-        self._loop = loop or asyncio.get_event_loop()
-
-
-    def _notify(self, episodes):
+    async def _notify(self, episodes: Sequence[Episode]) -> None:
         raise NotImplementedError
 
-
-    def notify(self, episodes):
-        return self._notify(episodes)
+    async def notify(self, episodes: Sequence[Episode]) -> None:
+        await self._notify(episodes)

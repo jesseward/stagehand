@@ -1,29 +1,38 @@
+from __future__ import annotations
+
+import asyncio
 import json
-import socket
-import urllib
-import logging
-import re
 import os
 import time
-import asyncio
+from collections.abc import Sequence
+from typing import TYPE_CHECKING, Any
 
 from ..config import config
-from ..toolbox import tobytes, tostr
-from ..toolbox.net import download
-from .base import NotifierBase, NotifierError
+from ..logger import getLogger
+from .base import NotifierBase
 from .xbmc_config import config as modconfig
 
-__all__ = ['Notifier']
+if TYPE_CHECKING:
+    from ..tvdb import Episode
 
-log = logging.getLogger('stagehand.notifiers.xbmc')
+__all__ = ['Notifier', 'modconfig']
+
+log = getLogger('stagehand.notifiers.xbmc')
+
 
 class Notifier(NotifierBase):
-    def __init__(self, loop=None):
-        super().__init__(loop)
+    """
+    Asks XBMC/Kodi (via its JSON-RPC TCP interface) to rescan its library
+    when new episodes are retrieved.
+    """
+    def __init__(self) -> None:
+        super().__init__()
         self._rpcver = 0
+        self._rpcreader: asyncio.StreamReader | None = None
+        self._rpcwriter: asyncio.StreamWriter | None = None
 
-    @asyncio.coroutine
-    def _jsonrpc(self, method, params):
+    async def _jsonrpc(self, method: str, params: Any) -> Any:
+        assert self._rpcreader is not None and self._rpcwriter is not None
         request = {
             'jsonrpc': '2.0',
             'method': method,
@@ -31,59 +40,62 @@ class Notifier(NotifierBase):
             'id': 1
         }
         log.debug2('issuing JSON-RPC method=%s params=%s', method, params)
-        buf = tobytes(json.dumps(request))
-        self._rpcwriter.write(buf)
-        data = yield from asyncio.wait_for(self._rpcreader.read(2048), timeout=5)
+        self._rpcwriter.write(json.dumps(request).encode('utf-8'))
+        await self._rpcwriter.drain()
+        data = await asyncio.wait_for(self._rpcreader.read(65536), timeout=5)
         try:
-            response = json.loads(tostr(data))
-            return response['result']
+            return json.loads(data)['result']
         except (ValueError, KeyError):
             log.error('unexpected response from JSON-RPC: %s...', data[:1000])
+            return None
 
 
-    @asyncio.coroutine
-    def _wait_for_idle(self, timeout=120):
+    async def _wait_for_idle(self, max_wait: float = 120) -> bool:
         """
         Waits until XBMC is idle (i.e. not scanning library).
 
         :returns: True if XBMC is idle, False if it isn't (due to timeout), or
                   None if JSON-RPC isn't working.
         """
-        t0 = time.time()
-        while time.time() - t0 < timeout:
-            result = yield from self._jsonrpc('XBMC.GetInfoBooleans', {'booleans': ['library.isscanning']})
-            if not result or result.get('library.isscanning') != True:
+        t0 = time.monotonic()
+        while time.monotonic() - t0 < max_wait:
+            result = await self._jsonrpc('XBMC.GetInfoBooleans', {'booleans': ['library.isscanning']})
+            if not result or result.get('library.isscanning') is not True:
                 return True
             log.debug2('XBMC busy scanning, waiting')
-            yield from asyncio.sleep(1)
+            await asyncio.sleep(1)
         return False
 
 
-    @asyncio.coroutine
-    def _send_notification(self, title, msg):
-        result = yield from self._jsonrpc('GUI.ShowNotification', [title, msg])
-        return result
+    async def _send_notification(self, title: str, msg: str) -> Any:
+        return await self._jsonrpc('GUI.ShowNotification', [title, msg])
 
-
-    @asyncio.coroutine
-    def _update_library(self, path=""):
+    async def _update_library(self, path: str = '') -> Any:
         path = path + '/' if path and not path.endswith('/') else path
-        result = yield from self._jsonrpc('VideoLibrary.scan', [path])
-        return result
+        return await self._jsonrpc('VideoLibrary.scan', [path])
 
+    async def _do_notify(self, episodes: Sequence[Episode]) -> None:
+        self._rpcreader, self._rpcwriter = await asyncio.open_connection(str(modconfig.hostname),
+                                                                         int(modconfig.tcp_port))
+        try:
+            await self._do_notify_connected(episodes)
+        finally:
+            self._rpcwriter.close()
+            await self._rpcwriter.wait_closed()
 
-    @asyncio.coroutine
-    def _do_notify(self, episodes):
-        self._rpcreader, self._rpcwriter = yield from asyncio.open_connection(str(modconfig.hostname), int(modconfig.tcp_port), loop=self._loop)
+    async def _do_notify_connected(self, episodes: Sequence[Episode]) -> None:
         # Determine JSON-RPC API version used by XBMC.
-        result = yield from self._jsonrpc('JSONRPC.Version', [])
-        self._rpcver = result.get('version', {'major': 0})['major']
-        log.warning('rpc version %d', self._rpcver)
+        result = await self._jsonrpc('JSONRPC.Version', [])
+        try:
+            self._rpcver = int(result['version']['major'])
+        except (KeyError, TypeError, ValueError):
+            self._rpcver = 0
+        log.debug('rpc version %d', self._rpcver)
 
         # We need to disable notifications as they can precede
         # responses to methods we invoke and we don't handle that (nor do
         # we need to).
-        config = {
+        notifications = {
             'Application': False,
             'GUI': False,
             'System': False,
@@ -92,7 +104,7 @@ class Notifier(NotifierBase):
             'VideoLibrary': False,
             'Other': False
         }
-        yield from self._jsonrpc('JSONRPC.SetConfiguration', {'notifications': config})
+        await self._jsonrpc('JSONRPC.SetConfiguration', {'notifications': notifications})
 
         # Get a list of all series directories for new episodes.  We
         # _could_ add the season directory, except that if the series isn't
@@ -101,40 +113,39 @@ class Notifier(NotifierBase):
         # season directory properly.  But there doesn't seem to be a way to
         # distinguish this.  VideoLibrary.GetTVShows isn't foolproof because
         # XBMC doesn't provide the path to the series.
-        dirs = set(ep.series.path for ep in episodes)
+        dirs = {ep.series.path for ep in episodes}
 
         # Translate local path to XBMC path.
         if modconfig.tvdir:
             # Normalize local and remote paths so they have trailing slash
-            frm = os.path.normpath(config.misc.tvdir) + '/'
+            frm = os.path.normpath(os.path.expanduser(config.misc.tvdir)) + '/'
             to = os.path.normpath(modconfig.tvdir) + '/'
-            dirs = [re.sub(r'^' + frm, to, dir) for dir in dirs]
+            dirs = {to + d[len(frm):] if d.startswith(frm) else d for d in dirs}
 
-        yield from self._wait_for_idle()
+        await self._wait_for_idle()
         if modconfig.individual:
-                # Issue an update for each path.
-            for dir in dirs:
-                yield from self._update_library(dir)
-                yield from self._wait_for_idle()
+            # Issue an update for each path.
+            for d in sorted(dirs):
+                await self._update_library(d)
+                await self._wait_for_idle()
         else:
-            yield from self._update_library()
+            await self._update_library()
 
         if modconfig.notify:
             if len(episodes) == 1:
-                msg = 'New episode for {} available.'.format(episodes[0].series.name)
+                msg = f'New episode for {episodes[0].series.name} available.'
             else:
-                msg = '{} new episodes added to library.'.format(len(episodes))
-            yield from self._send_notification('New TV Episodes', msg)
+                msg = f'{len(episodes)} new episodes added to library.'
+            await self._send_notification('New TV Episodes', msg)
 
-        self._rpcwriter.close()
         log.debug('updated library with %d episodes', len(episodes))
 
-
-    @asyncio.coroutine
-    def _notify(self, episodes):
+    async def _notify(self, episodes: Sequence[Episode]) -> None:
         try:
-            yield from self._do_notify(episodes)
-        except asyncio.TimeoutError:
+            await self._do_notify(episodes)
+        except TimeoutError:
             log.error('timed out waiting for XBMC server')
+        except OSError as e:
+            log.error('unable to connect to XBMC server: %s', e)
         else:
-            log.info('send xbmc notification')
+            log.info('sent xbmc notification')

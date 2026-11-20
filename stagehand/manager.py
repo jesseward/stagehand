@@ -1,42 +1,67 @@
-import os
-import time
-import re
-import logging
-import random
-import gc
+"""
+The Manager coordinates Stagehand's work: periodically checking for new
+episodes, searching for them, and retrieving search results.
+"""
+from __future__ import annotations
+
 import asyncio
+import gc
+import html
+import os
+import random
+import time
+from dataclasses import dataclass
 from datetime import datetime, timedelta
+from typing import Any
 
-from . import web, searchers, retrievers, notifiers, providers
-from .toolbox import FutureProgress, singleton
-from .toolbox.utils import fsname
-from .toolbox.dateutils import to_timestamp
-from .toolbox.config import get_default
-from .tvdb import TVDB
+from . import notifiers, providers, retrievers, searchers, web
 from .config import config
+from .logger import getLogger
+from .retrievers import RetrieverAbortedHard, RetrieverError, RetrieverSoftError
+from .searchers import SearchResult
+from .toolbox import FutureProgress, singleton, spawn
+from .toolbox.config import get_default
+from .tvdb import TVDB, Episode, Series
 from .utils import fixsep
-from .searchers import SearcherError
-from .retrievers import RetrieverError, RetrieverSoftError, RetrieverHardError, RetrieverAborted, RetrieverAbortedHard, RetrieverAbortedSoft
-from .notifiers import NotifierError
 
-log = logging.getLogger('stagehand.manager')
+log = getLogger('stagehand.manager')
+
+# How often to check providers for updated series metadata.
+TVDB_UPDATE_INTERVAL = 4 * 60 * 60
+
+
+@dataclass
+class Paths:
+    """
+    Locations of Stagehand's data, config, cache, and log files.
+    """
+    data: str
+    config: str
+    db: str
+    webcache: str
+    logs: str
+
+    def create(self) -> None:
+        os.makedirs(self.webcache, exist_ok=True)
+        os.makedirs(self.logs, exist_ok=True)
+        os.makedirs(os.path.dirname(self.config), exist_ok=True)
 
 
 class Manager:
-    def __init__(self, paths, *, loop=None):
-        super().__init__()
+    def __init__(self, paths: Paths) -> None:
         self.paths = paths
-        self.loop = loop or asyncio.get_event_loop()
         self._retrieve_queue_event = asyncio.Event()
         # A list of episodes to be retrieved.
         # [(Episode, [SearchResult, ...]), (Episode, [SearchResult, ...])]
-        self._retrieve_queue = []
+        self._retrieve_queue: list[tuple[Episode, list[SearchResult]]] = []
         # Like _retrieve_queue, but these are the episodes actively being processed.
         # The first SearchResult is the one being retrieved.
-        self._retrieve_queue_active = []
-        # Maps Episode objects to InProgress objects for active downloads.
-        self._retrieve_tasks = {}
-        self._next_episode_check_timer  = None
+        self._retrieve_queue_active: list[tuple[Episode, list[SearchResult]]] = []
+        # Maps Episode objects to Tasks for active downloads.
+        self._retrieve_tasks: dict[Episode, asyncio.Task[None]] = {}
+        self._retrieve_progress: dict[Episode, FutureProgress] = {}
+        self._next_episode_check_timer: asyncio.TimerHandle | None = None
+        self._tvdb_update_timer: asyncio.TimerHandle | None = None
 
         # If the config schema changed (new version of Stagehand installed?)
         # then write out a new config file.
@@ -47,30 +72,27 @@ class Manager:
         config.autosave = True
         config.signals['reloaded'].connect(self._load_config)
 
-        self.tvdb = TVDB(paths.db, loop=self.loop)
+        self.tvdb = TVDB(paths.db)
 
 
-    @asyncio.coroutine
-    def start(self):
+    async def start(self) -> None:
         """
         Starts the Stagehand manager, which starts all plugins and
         schedules tasks for
         """
-        yield from self._load_config()
+        await self._load_config()
 
-        # TODO: randomize time, twice a day
-        self.loop.call_soon(asyncio.async, self._check_update_tvdb())
-        #web.notify('alert', title='Global alert', text='Stagehand was restarted')
+        spawn(self._check_update_tvdb(), name='tvdb-update')
 
         self._schedule_next_episode_check(skip_current_hour=False)
-        yield from self.check_new_episodes()
+        await self.check_new_episodes()
 
         # Start all plugins in parallel
-        yield from asyncio.gather(searchers.start(self), retrievers.start(self),
+        await asyncio.gather(searchers.start(self), retrievers.start(self),
                                   notifiers.start(self), providers.start(self))
 
         # Resume downloading any episodes we aborted by adding to retrieve queue.
-        log.info('checking all epsiodes to see if any need resuming')
+        log.info('checking all episodes to see if any need resuming')
         for series in self.tvdb.series:
             for ep in series.episodes:
                 if ep.ready and ep.search_result:
@@ -78,16 +100,16 @@ class Manager:
             # For a large number of series, this loop (which involves reading
             # all episodes from the database) can take some time.  So yield
             # back to the main loop so we don't starve other tasks.
-            yield
+            await asyncio.sleep(0)
 
         # Start the retrieve queue processor
         self._retrieve_queue_processor()
+        self._retrieve_queue_event.set()
         log.info('stagehand started, waiting for next new episodes check')
 
 
 
-    @asyncio.coroutine
-    def _load_config(self, changed=None):
+    async def _load_config(self, changed: list[str] | None = None) -> None:
         if changed is not None:
             # if changed is given (even if it's an empty list), it means we've
             # been invoked from the config reloaded signal.
@@ -95,12 +117,12 @@ class Manager:
             if 'retrievers.parallel' in changed:
                 # Might have increased the number of parallel downloads allowed.
                 # Wake up retrieve queue manager.
-                self._retrieve_queue_processor_signal.emit_when_handled()
-        yield from self._load_series_from_config()
+                self._retrieve_queue_event.set()
+        await self._load_series_from_config()
 
 
 
-    def _schedule_next_episode_check(self, skip_current_hour=True):
+    def _schedule_next_episode_check(self, skip_current_hour: bool = True) -> None:
         try:
             hours = sorted(int(h) for h in config.searchers.hours.split(','))
         except ValueError:
@@ -122,14 +144,17 @@ class Manager:
         log.info('scheduling next episode check for %s', next)
         if self._next_episode_check_timer:
             self._next_episode_check_timer.cancel()
-        delta = to_timestamp(next) - time.time()
-        handle = self.loop.call_at(self.loop.time() + delta, asyncio.async,
-                                    self.check_new_episodes(reschedule=True))
-        self._next_episode_check_timer = handle
+        loop = asyncio.get_running_loop()
+        delta = next.timestamp() - time.time()
+        self._next_episode_check_timer = loop.call_at(loop.time() + delta, self._scheduled_episode_check)
+
+    def _scheduled_episode_check(self) -> None:
+        self._next_episode_check_timer = None
+        self.check_new_episodes(reschedule=True)
 
 
     @property
-    def retrieve_queue(self):
+    def retrieve_queue(self) -> list[tuple[Episode, list[SearchResult]]]:
         """
         The current retrieve queue, in the form:
         [(Episode, [SearchResult, ...]), (Episode, [SearchResult, ...])]
@@ -141,22 +166,23 @@ class Manager:
 
 
 
-    @asyncio.coroutine
-    def _check_update_tvdb(self):
-        servertime = self.tvdb.get_last_updated()
-        if servertime and time.time() - float(servertime) > 60*60*24:
-            count = yield from self.tvdb.sync()
-        self.loop.call_later(4*60*60, asyncio.async, self._check_update_tvdb())
-        # FIXME: if count, need to go through all episodes and mark future episodes as STATUS_NEED
+    async def _check_update_tvdb(self) -> None:
+        try:
+            servertime = self.tvdb.get_last_updated()
+            if servertime and time.time() - float(servertime) > 60*60*24:
+                await self.tvdb.sync()
+                # FIXME: if count, need to go through all episodes and mark future episodes as STATUS_NEED
+        finally:
+            self._tvdb_update_timer = asyncio.get_running_loop().call_later(
+                TVDB_UPDATE_INTERVAL, lambda: spawn(self._check_update_tvdb(), name='tvdb-update'))
 
 
-    @asyncio.coroutine
-    def _add_series_to_db(self, id, fast=False):
+    async def _add_series_to_db(self, id: str, fast: bool = False) -> Series | None:
         log.info('adding new series %s to database', id)
-        series = yield from self.tvdb.add_series_by_id(id, fast=fast)
+        series = await self.tvdb.add_series_by_id(id, fast=fast)
         if not series:
             log.error('provider did not know about %s', id)
-            return
+            return None
         log.debug('found series %s (%s) on provider', id, series.name)
 
         # Initialize status for all old episodes as STATUS_IGNORE.  Note that
@@ -171,21 +197,22 @@ class Manager:
         return series
 
 
-    @asyncio.coroutine
-    def add_series(self, id):
+    async def add_series(self, id: str) -> Series | None:
         """
         Add new series by id, or return existing series if already added.
         """
         series = self.tvdb.get_series_by_id(id)
         if not series:
-            series = yield from self._add_series_to_db(id, fast=True)
+            series = await self._add_series_to_db(id, fast=True)
+            if not series:
+                return None
             if not self.tvdb.get_config_for_series(id, series):
                 identifier = 'date' if series.has_genre('talk show', 'news') else 'epcode'
                 config.series.append(config.series(id=id, path=fixsep(series.name), identifier=identifier))
         return series
 
 
-    def delete_series(self, id):
+    def delete_series(self, id: str) -> None:
         series = self.tvdb.get_series_by_id(id)
         if not series:
             return
@@ -198,8 +225,7 @@ class Manager:
         self.tvdb.delete_series(series)
 
 
-    @asyncio.coroutine
-    def _load_series_from_config(self):
+    async def _load_series_from_config(self) -> None:
         """
         Ensure all the TV series in the config are included in the DB.
         """
@@ -214,8 +240,8 @@ class Manager:
             if not series:
                 log.info('discovered new series %s in config; adding to database.', cfg.id)
                 try:
-                    series = yield from self._add_series_to_db(cfg.id)
-                except Exception as e:
+                    series = await self._add_series_to_db(cfg.id)
+                except Exception:
                     log.exception('failed to add series %s', cfg.id)
 
                 if not series:
@@ -232,7 +258,7 @@ class Manager:
                 if not cfg.provider:
                     cfg.provider = get_default(cfg.provider)
                 try:
-                    yield from series.change_provider(cfg.provider)
+                    await series.change_provider(cfg.provider)
                 except ValueError as e:
                     log.error('invalid config: %s', e.args[0])
 
@@ -246,11 +272,10 @@ class Manager:
             if series.id not in seen:
                 log.error('series %s (%s) in database but not config; ignoring', series.id, series.name)
                 self.tvdb.ignore_series_by_id(series.id)
-            # Loop over episodes as well just to warm the cache
-            for ep in series.episodes:
-                pass
+            # Access episodes as well just to warm the cache
+            _ = series.episodes
 
-    def get_episode_retrieve_task(self, ep):
+    def get_episode_retrieve_task(self, ep: Episode) -> asyncio.Task[None] | None:
         """
         Returns the Future object for the given Episode object if it is
         currently being retrieved, otherwise returns None.
@@ -258,17 +283,22 @@ class Manager:
         return self._retrieve_tasks.get(ep)
 
 
-    def is_episode_queued_for_retrieval(self, ep):
+    def get_episode_retrieve_progress(self, ep: Episode) -> FutureProgress | None:
+        """
+        Returns the progress object for the given Episode if it is currently
+        being retrieved, otherwise returns None.
+        """
+        return self._retrieve_progress.get(ep)
+
+
+    def is_episode_queued_for_retrieval(self, ep: Episode) -> bool:
         """
         Is the given episode currently queued for retrieval?
         """
-        for qep, qresults in self.retrieve_queue:
-            if ep == qep:
-                return True
-        return False
+        return any(ep == qep for qep, _ in self.retrieve_queue)
 
 
-    def cancel_episode_retrieval(self, ep):
+    def cancel_episode_retrieval(self, ep: Episode) -> None:
         # If the episode is in the pending queue, remove it.
         for qep, results in self._retrieve_queue[:]:
             if ep == qep:
@@ -280,40 +310,49 @@ class Manager:
             task.cancel()
 
 
-    def commit(self):
+    def commit(self) -> None:
+        """
+        Saves config and database state.  Called on shutdown.
+        """
         log.info('shutting down')
+        for timer in (self._next_episode_check_timer, self._tvdb_update_timer):
+            if timer:
+                timer.cancel()
         config.save(self.paths.config)
         self.tvdb.commit()
 
+    def close(self) -> None:
+        """
+        Saves state and releases resources.  The Manager can't be used
+        afterward.
+        """
+        self.commit()
+        config.watch(False)
+        self.tvdb.close()
 
-    def _notify_web_retriever_progress(self, progress=None):
+
+    def _notify_web_retriever_progress(self, progress: FutureProgress | None = None) -> None:
         """
         Issues a notification to web clients about the state of the current
         download queue.
         """
         queue = []
-        for ep, results in self.retrieve_queue:
-            task = self.get_episode_retrieve_task(ep)
-            if task:
-                progress = (
-                    task.progress.percentage,
-                    '%.1f' % (task.progress.pos / 1024.0 / 1024.0),
-                    '%.1f' % (task.progress.max / 1024.0 / 1024.0),
-                    int(task.progress.speed / 1024.0)
-                )
-            else:
-                progress = None
-            queue.append((ep.series.id, ep.code, progress))
+        for ep, _ in self.retrieve_queue:
+            p = self.get_episode_retrieve_progress(ep)
+            info = None
+            if p:
+                info = (p.percentage, f'{p.pos / 1024 / 1024:.1f}', f'{p.max / 1024 / 1024:.1f}', int(p.speed / 1024))
+            queue.append((ep.series.id, ep.code, info))
         web.notify('dlprogress', queue=queue, replace=True, universal=True)
 
 
 
-    @asyncio.coroutine
     @singleton
-    def check_new_episodes(self, only=[], force_next=False, reschedule=False):
+    async def check_new_episodes(self, only: list[Series] | None = None, force_next: bool = False,
+                                 reschedule: bool = False) -> tuple[dict[Series, list[Episode]], list[Episode]]:
         log.info('checking for new episodes and availability')
         # Get a list of all episodes that are ready for retrieval, building a list by series.
-        need = {}
+        need: dict[Series, list[Episode]] = {}
         for series in self.tvdb.series:
             if only and series not in only:
                 continue
@@ -338,29 +377,28 @@ class Manager:
         if gc.garbage:
             log.warning('uncollectable garbage exists: %s', gc.garbage)
 
-        found = []
+        found: list[Episode] = []
         if not need:
             log.info('no new episodes; we are all up to date')
         elif not config.searchers.enabled:
             log.error('episodes require fetching but no searchers are enabled')
         else:
-            found = yield from self._search_and_retrieve_needed_episodes(need)
+            found = await self._search_and_retrieve_needed_episodes(need)
 
         if reschedule:
             self._schedule_next_episode_check()
         return need, found
 
 
-    @asyncio.coroutine
-    def _search_and_retrieve_needed_episodes(self, need):
+    async def _search_and_retrieve_needed_episodes(self, need: dict[Series, list[Episode]]) -> list[Episode]:
         """
         Go through each series' need list and do a search for the required episodes,
         retrieving them if available.
         """
-        episodes_found = []
+        episodes_found: list[Episode] = []
         for series, episodes in need.items():
             log.info('searching for %d episode(s) of %s', len(episodes), series.name)
-            results = yield from searchers.search(series, episodes)
+            results = await searchers.search(series, episodes)
             if results:
                 # We have results, so add them to the retrieve queue and start
                 # the retriever coroutine (which is a no-op if it's already
@@ -385,26 +423,24 @@ class Manager:
                 self._retrieve_queue.extend(results.items())
                 self._retrieve_queue_event.set()
 
-        need_count = sum(len(l) for l in need.values())
+        need_count = sum(len(eps) for eps in need.values())
         log.info('new episode check finished, found %d/%d episodes', len(episodes_found), need_count)
         return episodes_found
 
 
     @singleton
-    @asyncio.coroutine
-    def _retrieve_queue_processor(self):
+    async def _retrieve_queue_processor(self) -> None:
         while True:
             try:
-                yield from self._do_retrieve_queue_processor()
+                await self._do_retrieve_queue_processor()
             except Exception:
                 log.exception('retrieve queue processor aborted, respawning')
-                yield from asyncio.sleep(1)
+                await asyncio.sleep(1)
             else:
                 break
 
 
-    @asyncio.coroutine
-    def _do_retrieve_queue_processor(self):
+    async def _do_retrieve_queue_processor(self) -> None:
         """
         This coroutine lives forever and monitors the retrieve queue.  If new episodes
         are found on the retrieve queue, it starts as many parallel downloads are allowed
@@ -413,8 +449,8 @@ class Manager:
         The processor can be "woken up" by setting _retrieve_queue_event.  This
         event should be set when the queue is changed.
         """
-        retrieved = []
-        active = {}
+        retrieved: list[Episode] = []
+        active: dict[asyncio.Future[Any], tuple[Episode, list[SearchResult]]] = {}
         log.debug('starting retrieve queue processor')
         while True:
             # Check the retrieve queue.  If the number of active downloads is less than
@@ -431,7 +467,7 @@ class Manager:
                     # so do notifications if so.
                     if retrieved and not active:
                         self._notify_web_retriever_progress()
-                        asyncio.async(notifiers.notify(retrieved))
+                        spawn(notifiers.notify(retrieved), name='notify')
                         retrieved = []
                 else:
                     log.debug2('popped %s from retrieve queue', ep)
@@ -463,29 +499,33 @@ class Manager:
                 # and continue to process additional episodes from the queue (if possible).
                 log.debug2('spawning episode retrieval task')
                 self._retrieve_queue_active.append((ep, ep_results))
-                task = asyncio.Task(self._get_episode(ep, ep_results))
+                task = asyncio.create_task(self._get_episode(ep, ep_results))
                 active[task] = ep, ep_results
                 continue
 
             # If we're here, then we've either filled up all the download slots or we have
             # exhausted the queue.  Wait now for any of the active downloads to finish, or
             # for the processor event to force us to pick up newly enqueued episodes.
-            tasks = list(active.keys()) + [self._retrieve_queue_event.wait()]
+            event_waiter = asyncio.create_task(self._retrieve_queue_event.wait())
+            tasks: set[asyncio.Future[Any]] = {*active.keys(), event_waiter}
             log.debug2('retrieve queue processor waiting for any of %d tasks', len(tasks))
-            done, pending = yield from asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+            try:
+                done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+            finally:
+                event_waiter.cancel()
             log.debug2('retrieve queue processor woke up, done=%d pending=%d', len(done), len(pending))
             # Just blindly clear the retrieve queue event.  The point of the
             # event is to wake us up, which we now are.  If it's already unset,
             # then this is a no-op.
             self._retrieve_queue_event.clear()
 
-            for task in done:
-                if task not in active:
-                    # This task must have been the retrieve queue even.  Ignore.
+            for done_task in done:
+                if done_task not in active:
+                    # This task must have been the retrieve queue event.  Ignore.
                     continue
 
                 # A download finished (or errored out).  Remove it from the active lists.
-                ep, ep_results = active.pop(task)
+                ep, ep_results = active.pop(done_task)
                 self._retrieve_queue_active.remove((ep, ep_results))
                 # Now that the episode has been removed from the retrieve
                 # queue, send an updated notification so the web client sees
@@ -497,7 +537,7 @@ class Manager:
                     # and returns True then retrieval was successful.  If it
                     # doesn't return True then none of the retrievers could
                     # get the episode.
-                    if task.result():
+                    if done_task.result():
                         retrieved.append(ep)
                 except RetrieverAbortedHard:
                     # Result was aborted by user, so do nothing.
@@ -511,8 +551,7 @@ class Manager:
                     web.notify('alert', title='Download Failed', text=msg % strerror, type='error')
 
 
-    @asyncio.coroutine
-    def _get_episode(self, ep, ep_results):
+    async def _get_episode(self, ep: Episode, ep_results: list[SearchResult]) -> bool:
         """
         Initiate the retriever plugin for the given search result.
 
@@ -525,18 +564,18 @@ class Manager:
             # TODO: handle failure
             os.makedirs(ep.season.path)
 
-        msg = 'starting retrieval of %s %s' % (ep.series.name, ep.code)
-        log.info(msg)
-        msg += '<br/><br/>Check progress of <a href="{{root}}/schedule/aired">active downloads</a>.'
-        web.notify('alert', title='Episode Download', text=msg)
+        log.info('starting retrieval of %s %s', ep.series.name, ep.code)
+        web.notify('alert', title='Episode Download',
+                   html=f'Starting retrieval of {html.escape(ep.series.name)} {ep.code}.<br/><br/>'
+                        'Check progress of <a href="{{root}}/downloads/">active downloads</a>.')
 
         for search_result in ep_results:
             # Determine name of target file based on naming preferences.
             if config.naming.rename:
                 ext = os.path.splitext(search_result.filename)[-1]
-                target = ep.preferred_path + fsname(ext.lower())
+                target = ep.preferred_path + ext.lower()
             else:
-                target = os.path.join(ep.season.path, fsname(search_result.filename))
+                target = os.path.join(ep.season.path, search_result.filename)
 
             ep.search_result = search_result
             ep.filename = os.path.basename(target)
@@ -547,16 +586,12 @@ class Manager:
                 try:
                     # retrieve() ensures that only RetrieverError is raised
                     progress = FutureProgress()
-                    if 1:
-                        task = asyncio.Task(retrievers.retrieve(progress, search_result, target, ep))
-                    else:
-                        log.debug('not actually retrieving %s %s', ep.series.name, ep.code)
-                        task = asyncio.Task(fake_download(progress, search_result, target, ep))
-                    task.progress = progress
+                    task = asyncio.create_task(retrievers.retrieve(progress, search_result, target, ep))
                     progress.connect(self._notify_web_retriever_progress)
                     self._retrieve_tasks[ep] = task
-                    yield from task
-                except RetrieverError as e:
+                    self._retrieve_progress[ep] = progress
+                    await task
+                except RetrieverError:
                     ep.filename = ep.search_result = None
                     if os.path.exists(target):
                         # TODO: handle permission problem
@@ -576,14 +611,7 @@ class Manager:
             finally:
                 # ep may not be in _retrieve_tasks if e.g. retrieve() raises
                 # an exception.
-                if ep in self._retrieve_tasks:
-                    del self._retrieve_tasks[ep]
+                self._retrieve_tasks.pop(ep, None)
+                self._retrieve_progress.pop(ep, None)
 
         return False
-
-@asyncio.coroutine
-def fake_download(progress, result, outfile, episode):
-    for i in range(100):
-        progress.set(i*1*1024*1024, 100*1024*1024, 2048)
-        print(progress.get_ascii_bar(), progress.speed)
-        yield from asyncio.sleep(1)

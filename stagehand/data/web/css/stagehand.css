@@ -1,0 +1,720 @@
+:root {
+    --accent: #5d5e80;
+    --accent-dark: #493e57;
+    --danger: #9d4f4f;
+    --border: #bbb;
+    font-family: Arial, Sans-Serif;
+}
+
+body {
+    margin: 0;
+}
+
+[hidden] {
+    display: none !important;
+}
+
+img {
+    border: 0;
+}
+
+a, a:visited {
+    text-decoration: none;
+    color: #74839a;
+}
+
+a:hover {
+    text-decoration: underline;
+}
+
+#banner {
+    background-image: url(../img/banner.jpg);
+    background-position: 50% 0px;
+}
+
+#logo {
+    background-image: url(../img/logo.png);
+    width: 303px;
+    height: 120px;
+}
+
+#banner #progress {
+    display: block;
+    position: absolute;
+    top: 85px;
+    right: 1em;
+    border-radius: 8px;
+    color: white;
+    border: 1px solid white;
+    height: 15px;
+    width: 100px;
+    opacity: 0.4;
+    cursor: pointer;
+}
+
+#banner #progress:hover {
+    opacity: 0.8;
+}
+
+#banner #progress span {
+    display: block;
+    border-radius: 4px;
+    height: 100%;
+    overflow: hidden;
+    background-color: white;
+    color: white;
+}
+
+.menu {
+    color: white;
+    width: 100%;
+    font-family: Tahoma, Sans-Serif;
+    padding: 0px;
+    margin: 0px;
+    float: left;
+    list-style: none;
+}
+
+.menu#main {
+    font-size: 135%;
+    background-color: rgba(0, 0, 0, 0.5);
+    margin-top: -5px;
+}
+
+.menu.submenu {
+    font-size: 100%;
+    background-color: rgba(93, 94, 128, 0.35);
+    display: none;
+}
+
+.menu.submenu.shown {
+    display: block;
+}
+
+.menu li {
+    margin: 0;
+    cursor: pointer;
+    float: left;
+    padding: 5px 1em;
+}
+
+.menu#main li {
+    border-right: 1px solid rgba(255, 255, 255, 0.3);
+    min-height: 29px;
+}
+
+.menu#main li:first-child {
+    border-left: 1px solid rgba(255, 255, 255, 0.3);
+}
+
+.menu#main li.active {
+    background-color: rgba(93, 94, 128, 0.5);
+}
+
+.menu li a {
+    display: inline-block;
+    color: white;
+    text-shadow: rgba(0, 0, 0, 0.5) 2px 2px 3px;
+}
+
+.menu li a img {
+    position: relative;
+    top: 3px;
+}
+
+.menu a:hover {
+    text-decoration: none;
+}
+
+.menu#main li:hover {
+    background-color: rgba(93, 94, 128, 0.5);
+}
+
+/* version */
+.menu#main li:last-child {
+    position: absolute;
+    margin: 0;
+    padding: 1em;
+    right: 1em;
+    font-size: 0.5em;
+    opacity: 0.5;
+    border: 0;
+    cursor: auto;
+}
+
+.menu#main li:last-child:hover {
+    background-color: transparent;
+}
+
+.menu.submenu li.active {
+    background-color: rgba(93, 94, 128, 0.8);
+}
+
+.menu.submenu li:hover {
+    background-color: rgba(93, 94, 128, 0.8);
+}
+
+h1 {
+    border-top: 1px solid #ccc;
+    border-bottom: 1px solid #ccc;
+    background-color: #eee;
+    padding: 0.2em 1.0em;
+    font-size: 120%;
+    font-family: Sans-Serif;
+    vertical-align: middle;
+    text-shadow: #aaa 2px 2px 2px;
+}
+
+div.section {
+    padding-left: 1em;
+    font-family: Arial, Sans-Serif;
+}
+
+div.section label:first-child {
+    padding: 0.4em 0.3em 0.4em 0;
+    width: 10em;
+    display: inline-block;
+    text-align: right;
+}
+
+.warning {
+    border: 1px solid #e0cd64;
+    background-color: #fffac4;
+    padding: 5px 15px 5px 15px;
+    vertical-align: middle;
+    text-align: center;
+    border-radius: 20px;
+}
+
+.schedule {
+    padding: 1em;
+}
+
+.schedule span {
+    color: #aaa;
+}
+
+.schedule .overview {
+    margin-left: 1.5em;
+    margin-top: 1em;
+    padding: 0.5em 2em 0.5em 1em;
+    border-left: 1px solid #ccc;
+    color: #777;
+    font-size: 90%;
+    text-align: justify;
+    background: linear-gradient(to right, #eee, #f5f5f5);
+}
+
+.schedule .icons {
+    float: right;
+    margin-right: -5px;
+    margin-top: -10px;
+}
+
+.schedule .icons a {
+    opacity: 0.4;
+}
+
+.schedule .icons a:hover {
+    opacity: 1.0;
+}
+
+table.grid {
+    font-family: Sans-Serif;
+    border: 1px solid #222;
+    border-radius: 11px;
+    border-spacing: 0px;
+}
+
+table.grid th {
+    padding: 0.4em 2.0em;
+    background-color: #555;
+    color: white;
+}
+
+/* Top left corner */
+table.grid th:first-child {
+    border-top-left-radius: 10px;
+}
+
+/* Top right corner */
+table.grid th:last-child {
+    border-top-right-radius: 10px;
+}
+
+/* Bottom left corner */
+table.grid tr:last-child td:first-child {
+    border-bottom-left-radius: 10px;
+}
+
+/* Bottom right corner */
+table.grid tr:last-child td:last-child {
+    border-bottom-right-radius: 10px;
+}
+
+table.grid td {
+    padding: 0.3em 2.0em;
+}
+table.grid td a {
+    text-decoration: none;
+    color: inherit;
+    display: block;
+}
+
+table.grid tr:not(.heading):nth-child(odd) td {
+    background-color: #eee;
+}
+
+table.grid tr:not(.heading):nth-child(even) td {
+    background-color: white;
+}
+
+table.grid th, table.grid td {
+    text-align: left;
+}
+
+table.grid.align-center th, table.grid.align-center td {
+    text-align: center;
+}
+
+table.grid.interactive tr {
+    cursor: pointer;
+}
+
+table.grid.interactive tr:not(.heading):hover td {
+    background-color: #493e57;
+    color: white;
+    text-shadow: rgba(0, 0, 0, 0.5) 1px 1px 2px;
+}
+
+table.grid tr.heading {
+    cursor: auto;
+    background-color: black;
+}
+
+table.grid tr.heading td {
+    font-size: 110%;
+    color: white;
+}
+
+.quality span {
+   font-variant: small-caps;
+   font-size: 80%;
+   color: white;
+   border-radius: 5px;
+   padding: 2px 10px;
+   font-weight: bold;
+   text-shadow: #000 1px 1px 1px;
+   display: inline-block;
+   margin: 0;
+   width: 3em;
+}
+
+.quality span.uhd {
+   background-color: #548e6c;
+   border: 1px solid #38463c;
+}
+
+.quality span.hd {
+   background-color: #54698e;
+   border: 1px solid #383d46;
+}
+
+.quality span.sd {
+   background-color: #9d4f4f;
+   border: 1px solid #6d3939;
+}
+
+.quality span.any {
+   background-color: #644179;
+   border: 1px solid #412f4b;
+}
+
+.help {
+    display: none;
+}
+
+span.step {
+    display: table;
+    background-color: #ada6d9;
+    border: 1px solid #7971a9;
+    border-radius: 1em;
+    font-size: 140%;
+    font-weight: bold;
+    width: 1.7em;
+    height: 1.7em;
+}
+
+span.step span {
+    display: table-cell;
+    vertical-align: middle;
+    text-align: center;
+}
+
+/* ------------------------------------------------------------------------
+ * Form controls
+ * --------------------------------------------------------------------- */
+
+button, a.button {
+    display: inline-block;
+    font: inherit;
+    font-size: 90%;
+    padding: 0.35em 0.9em;
+    color: white;
+    background: linear-gradient(#6e6f94, var(--accent));
+    border: 1px solid #3e3f5a;
+    border-radius: 5px;
+    cursor: pointer;
+    text-decoration: none;
+    vertical-align: middle;
+}
+
+button:hover:not(:disabled), a.button:hover {
+    background: var(--accent-dark);
+    text-decoration: none;
+}
+
+button:focus-visible, a.button:focus-visible, input:focus-visible, select:focus-visible, summary:focus-visible {
+    outline: 2px solid #8f8fd6;
+    outline-offset: 1px;
+}
+
+button:disabled {
+    opacity: 0.45;
+    cursor: default;
+}
+
+button.danger {
+    background: linear-gradient(#b05f5f, var(--danger));
+    border-color: #6d3939;
+}
+
+input[type=text], input[type=search], input[type=password], select {
+    font: inherit;
+    padding: 0.3em 0.5em;
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    background-color: white;
+}
+
+.disabled label, .disabled img, .disabled p, .disabled span {
+    opacity: 0.3;
+}
+
+/* Segmented control: a group of radio buttons styled as joined buttons. */
+.segmented {
+    display: inline-flex;
+    vertical-align: middle;
+}
+
+.segmented input {
+    position: absolute;
+    opacity: 0;
+    pointer-events: none;
+}
+
+.segmented label {
+    padding: 0.3em 0.8em;
+    font-size: 90%;
+    border: 1px solid var(--border);
+    margin-left: -1px;
+    background-color: #f4f4f4;
+    cursor: pointer;
+    user-select: none;
+}
+
+div.section .segmented label:first-child {
+    width: auto;
+    text-align: center;
+}
+
+.segmented input:first-child + label {
+    border-radius: 5px 0 0 5px;
+}
+
+.segmented label:last-child {
+    border-radius: 0 5px 5px 0;
+}
+
+.segmented label:hover {
+    background-color: #e4e4ee;
+}
+
+.segmented input:checked + label {
+    color: white;
+    background-color: var(--accent);
+    border-color: #3e3f5a;
+}
+
+.segmented input:focus-visible + label {
+    outline: 2px solid #8f8fd6;
+}
+
+/* Toggle switch: a checkbox styled as a sliding switch. */
+input.switch {
+    appearance: none;
+    position: relative;
+    width: 3.6em;
+    height: 1.5em;
+    border-radius: 0.75em;
+    background-color: #bbb;
+    vertical-align: middle;
+    cursor: pointer;
+    transition: background-color 0.15s;
+    margin: 0 2px;
+}
+
+input.switch::before {
+    content: 'OFF';
+    position: absolute;
+    right: 0.5em;
+    top: 50%;
+    transform: translateY(-50%);
+    font-size: 0.65em;
+    font-weight: bold;
+    color: white;
+}
+
+input.switch.yesno::before {
+    content: 'NO';
+}
+
+input.switch::after {
+    content: '';
+    position: absolute;
+    top: 0.15em;
+    left: 0.15em;
+    width: 1.2em;
+    height: 1.2em;
+    border-radius: 50%;
+    background-color: white;
+    box-shadow: 0 1px 2px rgba(0, 0, 0, 0.4);
+    transition: transform 0.15s;
+}
+
+input.switch:checked {
+    background-color: var(--accent);
+}
+
+input.switch:checked::before {
+    content: 'ON';
+    left: 0.6em;
+    right: auto;
+}
+
+input.switch.yesno:checked::before {
+    content: 'YES';
+}
+
+input.switch:checked::after {
+    transform: translateX(2.1em);
+}
+
+input.switch:disabled {
+    opacity: 0.3;
+    cursor: default;
+}
+
+progress {
+    width: 150px;
+    height: 1.3em;
+    vertical-align: middle;
+    accent-color: var(--accent);
+}
+
+td.download-progress {
+    white-space: nowrap;
+}
+
+td.download-progress span {
+    display: block;
+    font-size: 11px;
+}
+
+/* ------------------------------------------------------------------------
+ * Tables
+ * --------------------------------------------------------------------- */
+
+table.grid th.sortable {
+    cursor: pointer;
+    user-select: none;
+}
+
+table.grid th[aria-sort=ascending]::after {
+    content: ' ▲';
+    font-size: 70%;
+}
+
+table.grid th[aria-sort=descending]::after {
+    content: ' ▼';
+    font-size: 70%;
+}
+
+table.grid tr.highlight td {
+    background-color: #ffe26f !important;
+    transition: background-color 0.5s;
+}
+
+/* Status buttons that slide out from behind an episode table. */
+#episode-button-bar {
+    position: absolute;
+    margin-top: 80px;
+    width: 45px;
+    padding: 15px 9px;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    align-items: center;
+    border: 1px solid #aaa;
+    border-radius: 10px 0 0 10px;
+    background-color: #eee;
+    box-shadow: inset 0 0 14px rgba(0, 0, 0, 0.15);
+    z-index: 0;
+    transition: margin-left 0.2s;
+}
+
+#episode-button-bar.open {
+    margin-left: -64px;
+}
+
+#episode-button-bar.stuck {
+    position: fixed;
+    top: 0;
+    margin-top: 40px;
+}
+
+#episode-button-bar button {
+    padding: 4px 8px;
+    line-height: 0;
+}
+
+#episode-button-bar button img {
+    width: 16px;
+}
+
+/* ------------------------------------------------------------------------
+ * Notifications, tooltips and dialogs
+ * --------------------------------------------------------------------- */
+
+#toasts {
+    position: fixed;
+    top: 1em;
+    right: 1em;
+    width: 300px;
+    max-width: calc(100vw - 2em);
+    display: flex;
+    flex-direction: column;
+    gap: 0.6em;
+    z-index: 100;
+}
+
+.toast {
+    position: relative;
+    padding: 0.7em 2em 0.7em 1em;
+    color: white;
+    background-color: rgba(40, 40, 60, 0.92);
+    border-left: 4px solid #8f8fd6;
+    border-radius: 6px;
+    box-shadow: 0 3px 10px rgba(0, 0, 0, 0.3);
+    font-size: 90%;
+    animation: toast-in 0.2s ease-out;
+    transition: opacity 0.2s;
+}
+
+.toast[data-type=error] {
+    border-left-color: #e06060;
+    background-color: rgba(90, 30, 30, 0.94);
+}
+
+.toast.closing {
+    opacity: 0;
+}
+
+.toast.busy .toast-body::before {
+    content: '';
+    display: inline-block;
+    width: 16px;
+    height: 16px;
+    margin-right: 0.5em;
+    vertical-align: middle;
+    background: url(../img/throbber.gif) center / contain no-repeat;
+}
+
+.toast-title {
+    font-weight: bold;
+    margin-bottom: 0.2em;
+}
+
+.toast-title:empty {
+    display: none;
+}
+
+.toast-body code {
+    white-space: pre-wrap;
+}
+
+.toast-body a {
+    color: #c8c8ff;
+}
+
+.toast-close {
+    position: absolute;
+    top: 0.2em;
+    right: 0.3em;
+    padding: 0 0.3em;
+    font-size: 130%;
+    line-height: 1;
+    color: white;
+    background: none;
+    border: 0;
+}
+
+@keyframes toast-in {
+    from { opacity: 0; transform: translateY(-0.5em); }
+}
+
+.tip {
+    position: absolute;
+    max-width: 20em;
+    padding: 0.6em 0.8em;
+    font-size: 85%;
+    line-height: 1.35;
+    color: white;
+    background-color: rgba(30, 30, 40, 0.95);
+    border-radius: 5px;
+    box-shadow: 0 2px 8px rgba(0, 0, 0, 0.3);
+    z-index: 90;
+    pointer-events: none;
+}
+
+.tip p {
+    margin: 0 0 0.5em;
+}
+
+.tip p:last-child {
+    margin: 0;
+}
+
+dialog.confirm {
+    max-width: 26em;
+    padding: 1.2em 1.5em;
+    border: 1px solid #888;
+    border-radius: 8px;
+    box-shadow: 0 6px 24px rgba(0, 0, 0, 0.35);
+}
+
+dialog.confirm::backdrop {
+    background-color: rgba(0, 0, 0, 0.4);
+}
+
+dialog.confirm h2 {
+    margin: 0 0 0.6em;
+    font-size: 115%;
+}
+
+dialog.confirm form {
+    display: flex;
+    justify-content: flex-end;
+    gap: 0.6em;
+    margin-top: 1em;
+}

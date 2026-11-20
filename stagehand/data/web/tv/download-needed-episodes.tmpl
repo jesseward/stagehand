@@ -1,0 +1,26 @@
+<script>
+ready(() => {
+    const button = $('#{{buttonid}}');
+    const showid = '{{showid}}';
+    button.addEventListener('click', async () => {
+        button.disabled = true;
+        // Highlight rows of needed episodes while searching.
+        const rows = $$('img[alt^="Needed"]').map(img => img.closest('tr'));
+        rows.forEach(row => row.classList.add('highlight'));
+        const note = toast({ title: 'Episode check', text: 'Searching ...', busy: true });
+        try {
+            const { need, found } = await stagehand.api('/api/shows/check', { data: { id: showid } });
+            const text = need
+                ? `Found ${found} of ${need} episodes ${showid ? 'for this' : 'across all'} series.`
+                : `No episodes of ${showid ? 'this' : 'any'} series need downloading.`;
+            note.update({ text, busy: false, delay: 4000 });
+        } catch (e) {
+            note.update({ html: `Search failed with the error:<br><code>${escapeHTML(e.message)}</code>`,
+                          type: 'error', busy: false, sticky: true });
+        } finally {
+            button.disabled = false;
+            rows.forEach(row => row.classList.remove('highlight'));
+        }
+    });
+});
+</script>

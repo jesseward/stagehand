@@ -1,15 +1,26 @@
-import os
-import logging
-import time
-import asyncio
+from __future__ import annotations
 
-from ..config import config
-from .base import RetrieverBase, RetrieverError, RetrieverAbortedSoft
+import asyncio
+import contextlib
+import logging
+from typing import TYPE_CHECKING, Any
+
 from ..toolbox.net import download
+from .base import RetrieverAbortedSoft, RetrieverBase, RetrieverError
+
+if TYPE_CHECKING:
+    from ..searchers.base import SearchResult
+    from ..toolbox import FutureProgress
+    from ..tvdb import Episode
 
 __all__ = ['Retriever']
 
 log = logging.getLogger('stagehand.retrievers.http')
+
+# Begin verifying the file once this many bytes have been downloaded.
+VERIFY_AFTER_BYTES = 512 * 1024
+VERIFY_INTERVAL = 1.0
+
 
 class Retriever(RetrieverBase):
     NAME = 'http'
@@ -17,65 +28,71 @@ class Retriever(RetrieverBase):
     SUPPORTED_TYPES = ('http',)
     ALWAYS_ENABLED = True
 
-    def _verify_timer(self, progress, episode, result, outfile, task):
-        # Wait until we have 512KB before checking file.
-        if progress.pos >= 512*1024:
+    async def _verify_while_downloading(self, progress: FutureProgress, episode: Episode, result: SearchResult,
+                                        outfile: str, task: asyncio.Task[Any]) -> tuple[Any, ...] | None:
+        """
+        Periodically checks the partially downloaded file, cancelling the
+        download task if it fails verification.
+
+        :returns: the reason for cancelling the download, or None if the file
+                  was verified (or couldn't be).
+        """
+        while not task.done():
+            await asyncio.sleep(VERIFY_INTERVAL)
+            if progress.pos < VERIFY_AFTER_BYTES:
+                continue
             try:
-                r = self.verify_result_file(episode, result, outfile)
+                verified = await self.verify_result_file(episode, result, outfile)
             except RetrieverError as e:
-                # Verify failed, abort download.
-                log.info('cancelling download')
-                task.cancelmsg = e.args
+                log.info('cancelling download: %s', e)
                 task.cancel()
-                return
-            else:
-                if r is not False or progress.percentage >= 100:
-                    # verify function returned either True (verified ok) or None
-                    # (no ability to get metadata).  Either way, stop the timer.
-                    return
-        return self._loop.call_later(1, self._verify_timer, progress, episode, result, outfile, task)
+                return e.args
+            if verified is not False or progress.percentage >= 100:
+                # Either verified ok, or no ability to get metadata.  Either
+                # way, we're done checking.
+                return None
+        return None
 
+    def _download_progress_cb(self, ep: Episode, progress: FutureProgress) -> None:
+        log.debug('[%s %s] %d KB/s, %d KB / %d KB', ep.series.name, ep.code, progress.speed / 1024,
+                  progress.pos / 1024, progress.max / 1024)
 
-    def _download_progress_cb(self, ep, progress):
-        log.debug('[%s %s] %d KB/s, %d KB / %d KB', ep.series.name, ep.code, progress.speed/1024, progress.pos/1024, progress.max/1024)
-
-
-    @asyncio.coroutine
-    def _retrieve(self, progress, episode, result, outfile):
+    async def _retrieve(self, progress: FutureProgress, episode: Episode, result: SearchResult,
+                        outfile: str) -> None:
         """
         Retrieve the given SearchResult object.
         """
-        rdata = yield from result.get_retriever_data()
+        rdata = await result.get_retriever_data()
         if not rdata.get('url'):
             raise RetrieverError('Searcher did not provide a URL')
 
-        opts = {}
+        opts: dict[str, Any] = {}
         if 'username' in rdata:
-            opts['auth'] = rdata['username'], rdata.get('password', '')
+            opts['auth'] = (str(rdata['username']), str(rdata.get('password', '')))
         if 'retry' in rdata:
-            opts['retry'] = rdata['retry']
+            opts['retry'] = int(rdata['retry'])
 
         # Before we start fetching, initialize progress.
         if result.size:
-            progress.set(0, result.size / 1024.0, 0)
+            progress.set(0, result.size, 0)
 
         log.debug('fetching %s', rdata['url'])
         progress.connect(self._download_progress_cb, episode)
-        task = asyncio.Task(download(rdata['url'], outfile, progress=progress, **opts))
-        self._loop.call_later(1, self._verify_timer, progress, episode, result, outfile, task)
-
+        task = asyncio.create_task(download(rdata['url'], outfile, progress=progress, **opts))
+        verifier = asyncio.create_task(self._verify_while_downloading(progress, episode, result, outfile, task))
         try:
-            task.cancelmsg = None
-            status, c = yield from task
+            status, written = await task
         except asyncio.CancelledError:
-            if task.cancelmsg:
-                raise RetrieverAbortedSoft(*task.cancelmsg)
-            else:
-                raise
+            if verifier.done() and (reason := verifier.result()):
+                raise RetrieverAbortedSoft(*reason) from None
+            raise
         finally:
+            verifier.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await verifier
             progress.disconnect(self._download_progress_cb)
 
-        if status == 416 and c.content_length_download == 0:
+        if status == 416:
             log.info('file already fully retrieved')
         elif status not in (200, 206):
-            raise RetrieverError('Status %d != 200' % status)
+            raise RetrieverError(f'download failed (status {status})')

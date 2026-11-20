@@ -1,16 +1,15 @@
-import logging
-import urllib
-import time
-import os
-import json
-import asyncio
-import itertools
+from __future__ import annotations
 
-from .base import ProviderBase, ProviderSearchResultBase, ProviderError
+import itertools
+import json
+import logging
+import time
+import urllib.parse
+from typing import Any
+
 from ..toolbox import db
 from ..toolbox.net import download
-from ..toolbox.utils import tostr
-from ..config import config
+from .base import ProviderBase, ProviderError, ProviderSearchResultBase, SeriesDict, parse_airtime
 
 __all__ = ['Provider']
 
@@ -19,42 +18,21 @@ log = logging.getLogger('stagehand.providers.thetvdb')
 
 class ProviderSearchResult(ProviderSearchResultBase):
     @property
-    def pid(self):
+    def pid(self) -> str:
         # tvdb_id is a plain numeric string; id may be prefixed like "series-NNNN"
         raw = self._attrs.get('tvdb_id') or self._attrs.get('id', '')
         return str(raw).split('-')[-1]
 
     @property
-    def name(self):
-        return self._attrs.get('name')
-
-    @property
-    def names(self):
-        yield self.name
-
-    @property
-    def overview(self):
+    def overview(self) -> str | None:
         return self._attrs.get('overview')
 
     @property
-    def imdb(self):
-        # Not available in search results
-        return None
-
-    @property
-    def year(self):
-        started = self.started
-        if started and len(started.split('-')) == 3:
-            return started.split('-')[0]
-        else:
-            return started
-
-    @property
-    def started(self):
+    def started(self) -> str | None:
         return self._attrs.get('first_air_time')
 
     @property
-    def banner(self):
+    def banner(self) -> str | None:
         return self._attrs.get('image_url')
 
 
@@ -67,26 +45,25 @@ class Provider(ProviderBase):
     # Tokens are valid for 1 month; trim a bit to be safe.
     TOKEN_LIFETIME_SECONDS = 29 * 24 * 3600
 
-    def __init__(self, db):
-        super().__init__(db)
-        self.hostname = 'https://www.thetvdb.com'
+    API_URL = 'https://api4.thetvdb.com/v4'
+
+    def __init__(self, tvdb: Any) -> None:
+        super().__init__(tvdb)
         self._apikey = '17b1544f-5e79-4145-9e61-db722dd252c3'
-        self._token = None
-        self._token_time = 0
+        self._token: str | None = None
+        self._token_time = 0.0
 
-        db.register_object_type_attrs('series',
-            thetvdbid = (str, db.ATTR_SEARCHABLE | db.ATTR_INDEXED),
-            thetvdbcache = (dict, db.ATTR_SIMPLE)
+        tvdb.register_object_type_attrs('series',
+            thetvdbid=(str, db.ATTR_SEARCHABLE | db.ATTR_INDEXED),
+            thetvdbcache=(dict, db.ATTR_SIMPLE),
+        )
+        tvdb.register_object_type_attrs('episode',
+            thetvdbid=(str, db.ATTR_SEARCHABLE),
         )
 
-        db.register_object_type_attrs('episode',
-            thetvdbid = (str, db.ATTR_SEARCHABLE),
-        )
-
-
-    @asyncio.coroutine
-    def _rawapi(self, path, token=None, method='GET', body=None):
-        url = 'https://api4.thetvdb.com/v4' + path
+    async def _rawapi(self, path: str, token: str | None = None, method: str = 'GET',
+                      body: str | None = None) -> tuple[int, Any]:
+        url = self.API_URL + path
         headers = {
             'Accept': 'application/json',
         }
@@ -94,33 +71,28 @@ class Provider(ProviderBase):
             headers['Authorization'] = 'Bearer ' + token
         if body:
             headers['Content-Type'] = 'application/json'
-        status, data = yield from download(url, retry=4, method=method, headers=headers, data=body)
-        return status, json.loads(data.decode('utf8')) if data else None
+        status, data = await download(url, retry=4, method=method, headers=headers, data=body)
+        return status, json.loads(data) if data else None
 
-
-    @asyncio.coroutine
-    def _login(self):
+    async def _login(self) -> str:
         body = json.dumps({'apikey': self._apikey})
-        status, response = yield from self._rawapi('/login', method='POST', body=body)
+        status, response = await self._rawapi('/login', method='POST', body=body)
         if status == 200 and response and response.get('data', {}).get('token'):
-            return response['data']['token']
-        else:
-            log.error('thetvdb login failed: %s', response)
-            raise ProviderError('thetvdb API login failed')
+            return str(response['data']['token'])
+        log.error('thetvdb login failed: %s', response)
+        raise ProviderError('thetvdb API login failed')
 
-
-    @asyncio.coroutine
-    def _api(self, path, method='GET', body=None):
+    async def _api(self, path: str, method: str = 'GET', body: str | None = None) -> tuple[int, Any]:
         """
         Invokes an API method, logging in or refreshing the token if necessary.
         """
         now = time.time()
         if not self._token or now - self._token_time > Provider.TOKEN_LIFETIME_SECONDS:
             # Acquire a new token
-            self._token = yield from self._login()
+            self._token = await self._login()
             self._token_time = now
 
-        status, response = yield from self._rawapi(path, self._token, method, body)
+        status, response = await self._rawapi(path, self._token, method, body)
         log.debug('API %s returned status %d', path, status)
         if status == 401:
             if self._token_time == now:
@@ -128,18 +100,17 @@ class Provider(ProviderBase):
             else:
                 # Token was refused before expiry.  Clear token and recurse to cause relogin.
                 self._token = None
-                status, response = yield from self._api(path, method, body)
+                status, response = await self._api(path, method, body)
         elif status != 200:
             log.debug('API %s returned status %d', path, status)
         return status, response
 
 
-    @asyncio.coroutine
-    def search(self, name):
-        results = []
+    async def search(self, name: str) -> list[ProviderSearchResultBase]:
+        results: list[ProviderSearchResultBase] = []
         quoted = urllib.parse.quote(name.replace('-', ' ').replace('_', ' '))
         log.info('searching TheTVDB for %s', name)
-        status, response = yield from self._api('/search?query=' + quoted + '&type=series')
+        status, response = await self._api('/search?query=' + quoted + '&type=series')
         if status == 200:
             if 'data' not in response:
                 log.warning('data element missing from response')
@@ -149,8 +120,7 @@ class Provider(ProviderBase):
         return results
 
 
-    @asyncio.coroutine
-    def get_series(self, id):
+    async def get_series(self, id: str) -> SeriesDict:
         log.debug('retrieving series data for %s', id)
         if not self.get_last_updated():
             # DB doesn't know about server time.  Set to current time so that
@@ -158,12 +128,12 @@ class Provider(ProviderBase):
             # point.
             self.db.set_metadata('thetvdb::servertime', int(time.time()))
 
-        series = {'episodes': []}
+        series: SeriesDict = {'episodes': []}
         log.info('fetching series %s from TheTVDB', id)
 
         # Use the extended endpoint to get genres, airsTime, and remoteIds,
         # with short=true to skip the heavy artworks/characters payload.
-        status, response = yield from self._api('/series/{}/extended?short=true'.format(id))
+        status, response = await self._api(f'/series/{id}/extended?short=true')
         if status != 200:
             return series
         elif 'data' not in response:
@@ -177,26 +147,18 @@ class Provider(ProviderBase):
         except (ValueError, KeyError, TypeError):
             pass
 
-        try:
-            airtime = data.get('airsTime', '')
-            if airtime:
-                try:
-                    timetuple = time.strptime(airtime, '%H:%M')
-                    series['airtime'] = tostr(time.strftime('%H:%M', timetuple))
-                except ValueError:
-                    timetuple = time.strptime(airtime, '%I:%M %p')
-                    series['airtime'] = tostr(time.strftime('%H:%M', timetuple))
-        except ValueError:
-            pass
+        airtime = parse_airtime(data.get('airsTime'))
+        if airtime:
+            series['airtime'] = airtime
 
         # Get any existing series and see if we need to fetch banner data.
-        existing = self.db.get_series_by_id('thetvdb:{}'.format(data['id']))
+        existing = self.db.get_series_by_id(f"thetvdb:{data['id']}")
         missing = not existing or not existing.banner_data
         image_url = data.get('image')
         if missing and image_url:
             log.debug('refresh series banner %s', image_url)
-            status, banner_data = yield from download(image_url, retry=3)
-            if status == 200:
+            status, banner_data = await download(image_url, retry=3)
+            if status == 200 and banner_data:
                 series['banner_data'] = banner_data
             else:
                 log.error('banner download failed for series %s', data.get('name', data['id']))
@@ -238,9 +200,7 @@ class Provider(ProviderBase):
 
         # Iterate over all pages of episodes.
         for page in itertools.count(0):
-            ep_status, ep_response = yield from self._api(
-                '/series/{}/episodes/default?page={}'.format(id, page)
-            )
+            ep_status, ep_response = await self._api(f'/series/{id}/episodes/default?page={page}')
             if ep_status != 200:
                 break
             elif 'data' not in ep_response:
@@ -268,16 +228,15 @@ class Provider(ProviderBase):
         return series
 
 
-    @asyncio.coroutine
-    def get_changed_series_ids(self):
+    async def get_changed_series_ids(self) -> list[str] | None:
         servertime = self.get_last_updated()
         if not servertime:
             # No servertime stored, so there must not be any series in db.
-            return
+            return None
         now = int(time.time())
 
         # Grab all series ids currently in the DB.
-        series = set([o[self.IDATTR] for o in self.db.query(type='series', attrs=[self.IDATTR])])
+        series = {o[self.IDATTR] for o in self.db.query(type='series', attrs=[self.IDATTR])}
 
         # The updates endpoint only supports lookback of up to ~3 months.
         # If we're beyond that window, refresh everything.
@@ -288,9 +247,9 @@ class Provider(ProviderBase):
             return list(series)
 
         ids = []
-        path = '/updates?since={}&type=series'.format(servertime)
+        path: str | None = f'/updates?since={servertime}&type=series'
         while path:
-            status, response = yield from self._api(path)
+            status, response = await self._api(path)
             if status == 200:
                 if 'data' not in response:
                     log.warning('data element missing from response')
@@ -303,7 +262,7 @@ class Provider(ProviderBase):
                 next_url = links.get('next')
                 if next_url:
                     # Strip base URL, keep just the path+query
-                    path = next_url.replace('https://api4.thetvdb.com/v4', '')
+                    path = next_url.replace(self.API_URL, '')
                 else:
                     path = None
             else:
@@ -315,5 +274,5 @@ class Provider(ProviderBase):
         return ids
 
 
-    def get_last_updated(self):
+    def get_last_updated(self) -> int:
         return int(self.db.get_metadata('thetvdb::servertime', 0))

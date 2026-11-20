@@ -1,16 +1,21 @@
-import os
-import urllib
-import urllib.parse
-import logging
-import re
-import asyncio
-from bs4 import BeautifulSoup
+from __future__ import annotations
 
-from ..config import config
+import logging
+import os
+import re
+import urllib.parse
+import xml.etree.ElementTree as ET
+from collections.abc import Sequence
+from typing import TYPE_CHECKING, Any
+
 from ..toolbox import dateutils
 from ..toolbox.net import download
-from .base import SearcherBase, SearchResult, SearcherError
+from .base import SearcherBase, SearcherError, SearchResult, SearchResults
 from .easynews_config import config as modconfig
+
+if TYPE_CHECKING:
+    from ..manager import Manager
+    from ..tvdb import Episode, Series
 
 
 __all__ = ['Searcher', 'modconfig']
@@ -26,63 +31,68 @@ class Searcher(SearcherBase):
     DEFAULT_URL_GLOBAL5 = 'https://members.easynews.com/global5/index.html?gps={keywords}&sbj={subject}&from=&ns=&fil=&fex=&vc=&ac=&fty[]=VIDEO&s1=nsubject&s1d=%2B&s2=nrfile&s2d=%2B&s3=dsize&s3d=%2B&pby=500&u=1&svL=&d1={date}&d1t=&d2=&d2t=&b1={size}&b1t=&b2=&b2t=&px1={res}&px1t=&px2=&px2t=&fps1=&fps1t=&fps2=&fps2t=&bps1=&bps1t=&bps2=&bps2t=&hz1=&hz1t=&hz2=&hz2t=&rn1=&rn1t=&rn2=&rn2t=&fly=2&pno=1&sS=5'
 
 
-    @asyncio.coroutine
-    def _search_global5(self, title, codes, size, date, res):
+    async def _search_global5(self, title: str, codes: str, size: str, date: str, res: str) -> bytes:
         if not modconfig.username or not modconfig.password:
-            raise ValueError('Configuration lacks username and/or password')
-
-        if 0 and os.path.exists('result.rss'):
-            print('Using cached result.rss')
-            return file('result.rss').read()
+            raise SearcherError('Configuration lacks username and/or password')
 
         url = modconfig.url or Searcher.DEFAULT_URL_GLOBAL5
         url = url.format(keywords=urllib.parse.quote_plus(title), subject=codes,
                          date=urllib.parse.quote_plus(date), size=size, res=res)
-        status, rss = yield from download(url, retry=modconfig.retries,
-                                          auth=(modconfig.username, modconfig.password))
-        if status != 200:
-            # TODO: handle status codes like 401 (unauth)
-            raise SearcherError('HTTP status not ok (%d)' % status)
-        #file('result.rss', 'w').write(rss)
+        status, rss = await download(url, retry=modconfig.retries,
+                                     auth=(str(modconfig.username), str(modconfig.password)))
+        if status == 401:
+            raise SearcherError('Easynews rejected the configured username or password')
+        elif status != 200 or rss is None:
+            raise SearcherError(f'HTTP status not ok ({status})')
         return rss
 
 
-    @asyncio.coroutine
-    def _search(self, series, episodes, date, min_size, quality):
+    async def _search(self, series: Series, episodes: Sequence[Episode], date: str | None, min_size: int | None,
+                      quality: str) -> SearchResults:
         title = series.cfg.search_string or series.name
         # Strip problem characters from the title, and substitute alternative apostrophe
         title = self.clean_title(title, apostrophe=Searcher.CLEAN_APOSTROPHE_REGEXP)
-        size = '%dM' % (min_size / 1048576) if min_size else '100M'
+        size = f'{min_size // 1048576}M' if min_size else '100M'
         # XXX: easynews doesn't support HEVC so remove resolution filtering.
         # res = '1x540' if quality == 'HD' else ''
         res = ''
 
-        results = []
+        results: list[SearchResult] = []
         for i in range(0, len(episodes), 10):
             batch = episodes[i:i+10]
-            codelist = [code for episode in batch \
-                             for code in self._get_episode_codes_regexp_list([episode])]
+            codelist = [code for episode in batch for code in self._get_episode_codes_regexp_list([episode])]
             codes = '|'.join(codelist)
             log.debug('searching for %d episodes, minimum size %s and res %s, keywords=%s subject=%s',
                       len(batch), size, res or 'any', title, codes)
-            rss = yield from self._search_global5(title, codes, size, date or '', res)
-            soup = BeautifulSoup(rss, 'html.parser')
-            for item in soup.find_all('item'):
-                result = SearchResult(self)
-                urlpath = urllib.parse.urlparse(item.enclosure['url']).path
-                result.filename = urllib.parse.unquote(os.path.split(urlpath)[-1])
-                result.size = self._parse_hsize(item.enclosure['length'])
-                result.date = dateutils.from_rfc822(item.pubdate.contents[0])
-                result.subject = ''.join(item.title.contents)
-                result.url = item.enclosure['url']
-                # TODO: parse out newsgroup
-                results.append(result)
+            rss = await self._search_global5(title, codes, size, date or '', res)
+            results.extend(self._parse_rss(rss))
 
         return {None: results}
 
+    def _parse_rss(self, rss: bytes) -> list[SearchResult]:
+        try:
+            root = ET.fromstring(rss)
+        except ET.ParseError as e:
+            raise SearcherError(f'unable to parse search results: {e}') from e
+        results = []
+        for item in root.iter('item'):
+            enclosure = item.find('enclosure')
+            if enclosure is None or not enclosure.get('url'):
+                log.debug('skipping search result without enclosure')
+                continue
+            result = SearchResult(self)
+            result.url = enclosure.get('url')
+            urlpath = urllib.parse.urlparse(result.url).path
+            result.filename = urllib.parse.unquote(os.path.split(urlpath)[-1])
+            result.size = self._parse_hsize(enclosure.get('length', '0'))
+            result.date = dateutils.from_rfc822(item.findtext('pubDate', ''))
+            result.subject = item.findtext('title', '')
+            # TODO: parse out newsgroup
+            results.append(result)
+        return results
 
-    @asyncio.coroutine
-    def _get_retriever_data(self, search_result):
+
+    async def _get_retriever_data(self, search_result: SearchResult) -> dict[str, Any]:
         return {
             'url': search_result.url,
             'username': modconfig.username,
@@ -91,20 +101,23 @@ class Searcher(SearcherBase):
         }
 
 
-    def _check_results_equal(self, a, b):
-        try:
-            # Easynews URLs contain hashes of the file, which is a convenient
-            # value to compare, because it means that even different URLs can
-            # end up being the same file.
-            a_hash = re.search(r'/([0-9a-f]{32,})', a.url).group(1)
-            b_hash = re.search(r'/([0-9a-f]{32,})', b.url).group(1)
+    def _check_results_equal(self, a: SearchResult, b: SearchResult) -> bool:
+        # Easynews URLs contain hashes of the file, which is a convenient
+        # value to compare, because it means that even different URLs can
+        # end up being the same file.
+        a_hash, b_hash = _url_hash(a.url), _url_hash(b.url)
+        if a_hash and b_hash:
             return a_hash == b_hash
-        except AttributeError:
-            # Wasn't able to find hash in URL, so compare the URLs directly.
-            return a.url == b.url
+        # Wasn't able to find hash in URL, so compare the URLs directly.
+        return a.url == b.url
 
 
-def enable(manager):
+def _url_hash(url: str | None) -> str | None:
+    m = re.search(r'/([0-9a-f]{32,})', url or '')
+    return m.group(1) if m else None
+
+
+def enable(manager: Manager) -> None:
     """
     Called by the web interface when the plugin is enabled where it was
     previously disabled.
@@ -114,5 +127,5 @@ def enable(manager):
     pass
 
 
-def get_config_template(manager):
+def get_config_template(manager: Manager) -> str:
     return os.path.join(manager.paths.data, 'web', 'settings', 'easynews.tmpl')

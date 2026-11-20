@@ -19,21 +19,28 @@
 # Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA
 # 02110-1301 USA
 # -----------------------------------------------------------------------------
-import sys
+from __future__ import annotations
+
+__all__ = ['get_encoding', 'tobytes', 'tostr', 'fsname', 'get_temp_path', 'tempfile', 'daemonize']
+
+import functools
+import getpass
 import locale
 import os
-import getpass
 import stat
-from tempfile import mktemp, gettempdir
+import sys
+import tempfile as _tempfile
+from typing import Any
 
-def _detect_encoding():
+
+def _detect_encoding() -> str | None:
     """
     Find correct encoding from default locale.
     """
     # Some locales report encodings like 'utf_8_valencia' which Python doesn't
     # know.  We try stripping off the right-most parts until we find an
     # encoding that works.
-    e = locale.getdefaultlocale()[1]
+    e: str | None = locale.getpreferredencoding(False)
     while e:
         try:
             ''.encode(e)
@@ -43,19 +50,22 @@ def _detect_encoding():
         if '_' not in e:
             break
         e = e.rsplit('_', 1)[0]
+    return None
 
 
 # If encoding can't be detected from locale, default to UTF-8.
-ENCODING = _detect_encoding() or 'UTF8'
+ENCODING = _detect_encoding() or 'utf-8'
 
-def get_encoding():
+
+def get_encoding() -> str:
     """
     Return the current encoding.
     """
     return ENCODING
 
 
-def tobytes(value, encoding=None, desperate=True, coerce=False, fs=False):
+def tobytes(value: Any, encoding: str | None = None, desperate: bool = True, coerce: bool = False,
+            fs: bool = False) -> Any:
     """
     Convert (if necessary) the given value to a "string of bytes", agnostic to
     any character encoding.
@@ -63,37 +73,30 @@ def tobytes(value, encoding=None, desperate=True, coerce=False, fs=False):
     :param value: the value to be converted to a string of bytes
     :param encoding: the character set to first try to encode to; if None, will
                      use the system default (from the locale).
-    :type encoding: str
     :param desperate: if True and encoding to the given (or default) charset
                       fails, will also try utf-8 and latin-1 (in that order),
                       and if those fail, will encode to the preferred charset,
-                      replacing unknown characters with \\\\uFFFD.
-    :type desperate: bool
+                      replacing unknown characters with \\uFFFD.
     :param coerce: if True, will coerce numeric types to a bytes object; if
                    False, such values will be returned untouched.
-    :type coerce: bool
     :param fs: indicates value is a file name or other environment string; if True,
                the encoding (if not explicitly specified) will be the encoding
                given by ``sys.getfilesystemencoding()`` and the error handler
-               used will be ``surrogateescape`` if supported.
-    :type fs: bool
+               used will be ``surrogateescape``.
     :returns: the value as a bytes object, or the original value if coerce is
               False and the value was not a bytes or string.
     """
     if isinstance(value, bytes):
-        # Nothing to do.
         return value
     elif isinstance(value, (int, float)):
-        return bytes(str(value), 'ascii') if coerce else value
+        return str(value).encode('ascii') if coerce else value
     elif not isinstance(value, str):
-        # Need to coerce to a unicode before converting to bytes.  We can't just
-        # feed it to bytes() in case the default character set can't encode it.
+        # Need to coerce to a str before converting to bytes.
         value = tostr(value, coerce=coerce)
 
     errors = 'strict'
     if fs:
-        if not encoding:
-            encoding = sys.getfilesystemencoding()
+        encoding = encoding or sys.getfilesystemencoding()
         errors = 'surrogateescape'
 
     for c in (encoding or ENCODING, 'utf-8', 'latin-1'):
@@ -107,217 +110,121 @@ def tobytes(value, encoding=None, desperate=True, coerce=False, fs=False):
     return value.encode(encoding or ENCODING, 'replace')
 
 
-def tostr(value, encoding=None, desperate=True, coerce=False, fs=False):
+def tostr(value: Any, encoding: str | None = None, desperate: bool = True, coerce: bool = False,
+          fs: bool = False) -> Any:
     """
-    Convert (if necessary) the given value to a unicode string.
+    Convert (if necessary) the given value to a str.
 
-    :param value: the value to be converted to a unicode string
+    :param value: the value to be converted to a str
     :param encoding: the character set to first try to decode as; if None, will
                      use the system default (from the locale).
-    :type encoding: str
     :param desperate: if True and decoding to the given (or default) charset
                       fails, will also try utf-8 and latin-1 (in that order),
                       and if those fail, will decode as the preferred charset,
-                      replacing unknown characters with \\\\uFFFD.
-    :type desperate: bool
-    :param coerce: if True, will coerce numeric types to a unicode string; if
-                   False, such values will be returned untouched.
-    :type coerce: bool
+                      replacing unknown characters with \\uFFFD.
+    :param coerce: if True, will coerce numeric types to a str; if False, such
+                   values will be returned untouched.
     :param fs: indicates value is a file name or other environment string; if True,
                the encoding (if not explicitly specified) will be the encoding
                given by ``sys.getfilesystemencoding()`` and the error handler
-               used will be ``surrogateescape`` if supported.
-    :type fs: bool
-    :returns: the value as a unicode string, or the original value if coerce is
-              False and the value was not a bytes or string.
+               used will be ``surrogateescape``.
+    :returns: the value as a str, or the original value if coerce is False and
+              the value was not a bytes or string.
     """
-    if isinstance(value, str):
-        # Nothing to do.
+    if value is None or isinstance(value, str):
         return value
     elif isinstance(value, (int, float)):
         return str(value) if coerce else value
     elif not isinstance(value, (bytearray, bytes)):
-        # Need to coerce this value.  Try the direct approach.
-        try:
-            return str(value)
-        except UnicodeError:
-            # Could be that value.__repr__ returned a non-unicode and
-            # non-8bit-clean string.  Be a bit more brute force about it.
-            return tostr(repr(value), desperate=desperate)
+        return str(value)
 
     errors = 'strict'
     if fs:
-        if not encoding:
-            encoding = sys.getfilesystemencoding()
+        encoding = encoding or sys.getfilesystemencoding()
         errors = 'surrogateescape'
 
-    # We now have a bytes object to decode.
     for c in (encoding or ENCODING, 'utf-8', 'latin-1'):
         try:
             return value.decode(c, errors)
         except UnicodeError:
             pass
         if not desperate:
-            raise UnicodeError("Couldn't decode value to unicode (and not desperate enough to keep trying)")
+            raise UnicodeError("Couldn't decode value to str (and not desperate enough to keep trying)")
 
     return value.decode(encoding or ENCODING, 'replace')
 
 
-def utf8(s):
+def fsname(s: str | bytes | None) -> str | None:
     """
-    Returns a UTF-8 string, converting from other character sets if
-    necessary.
-    """
-    return tostr(s).encode('utf-8')
-
-
-def fsname(s):
-    """
-    Return an object appropriate to represent a filename.
+    Return an object appropriate to represent a filename, or None if the
+    given value is None.
 
     :param s: the filename to decode (if needed)
     :returns: a string encoded with surrogateescape
-
-    .. note::
-       This is a convenience function, equivalent to::
-
-           tostr(s, fs=True, desperate=False)
     """
     return tostr(s, fs=True, desperate=False)
 
 
-
-def get_temp_path(appname):
+@functools.cache
+def get_temp_path(appname: str) -> str:
+    """
+    Returns (creating if necessary) a private temporary directory for the
+    current user and the given application name.
+    """
     try:
-        return get_temp_path.paths[appname]
-    except KeyError:
-        # create tmp directory for the user
-        base = gettempdir()
-        try:
-            user = getpass.getuser()
-        except Exception:
-            user = os.getuid()
-        path = os.path.join(base, '{}-{}'.format(appname, user))
-        if not os.path.isdir(path):
-            try:
-                os.mkdir(path, 0o0700)
-            except OSError:
-                # Probably the directory already exists.  Verify.
-                if not os.path.isdir(path):
-                    raise IOError('Security Error: %s is not a directory, aborted' % path)
-
-        # On non-Windows, verify the permissions.
-        if sys.platform != 'win32':
-            if os.path.islink(path):
-                raise IOError('Security Error: %s is a link, aborted' % path)
-            if stat.S_IMODE(os.stat(path).st_mode) % 0o01000 != 0o0700:
-                raise IOError('Security Error: %s has wrong permissions, aborted' % path)
-            if os.stat(path)[stat.ST_UID] != os.getuid():
-                raise IOError('Security Error: %s does not belong to you, aborted' % path)
-
-        get_temp_path.paths[appname] = path
-        return path
-get_temp_path.paths = {}
-
-
-def tempfile(appname, name='', suffix='', unique=True):
-    """
-    Return a filename in a secure tmp directory with the given name.
-
-    Name can also be a relative path in the temp directory, directories will
-    be created if missing. If unique is set, it will return a unique name based
-    on the given name.
-    """
-    path = get_temp_path(appname)
-    name = os.path.join(path, name)
-    if not os.path.isdir(os.path.dirname(name)):
-        os.mkdir(os.path.dirname(name))
-    if not unique:
-        return name
-    return mktemp(suffix=suffix, prefix=os.path.basename(name), dir=os.path.dirname(name))
-
-
-
-def which(file, path=None):
-    """
-    Does what which(1) does: searches the PATH in order for a given file name
-    and returns the full path to first match.
-    """
-    if not path:
-        path = os.getenv("PATH")
-
-    for p in path.split(":"):
-        fullpath = os.path.join(p, file)
-        try:
-            st = os.stat(fullpath)
-        except OSError:
-            continue
-
-        if sys.platform == 'win32':
-            return fullpath
-
-        # On non-Windows, ensure the file is both executable and accessible to
-        # the user.
-        if os.geteuid() == st[stat.ST_UID]:
-            mask = stat.S_IXUSR
-        elif st[stat.ST_GID] in os.getgroups():
-            mask = stat.S_IXGRP
-        else:
-            mask = stat.S_IXOTH
-
-        if stat.S_IMODE(st[stat.ST_MODE]) & mask:
-            return fullpath
-
-    return None
-
-
-def daemonize(stdin=os.devnull, stdout=os.devnull, stderr=None, pidfile=None, exit=True, chdir='/'):
-    """
-    Does a double-fork to daemonize the current process using the technique
-    described at http://www.erlenstar.demon.co.uk/unix/faq_2.html#SEC16 .
-
-    If exit is True (default), parent exits immediately.  If false, caller will receive
-    the pid of the forked child.
-    """
-    target_dir = chdir if chdir else os.getcwd()
-    # First fork.
+        user: str | int = getpass.getuser()
+    except Exception:
+        user = os.getuid()
+    path = os.path.join(_tempfile.gettempdir(), f'{appname}-{user}')
     try:
-        pid = os.fork()
-        if pid > 0:
-            if exit:
-                # Exit from the first parent.
-                sys.exit(0)
+        os.mkdir(path, 0o700)
+    except FileExistsError:
+        pass
 
-            # Wait for child to fork again (otherwise we have a zombie)
-            os.waitpid(pid, 0)
-            return pid
-    except OSError as e:
-        #log.error("Initial daemonize fork failed: %d, %s\n", e.errno, e.strerror)
-        sys.exit(1)
+    # Verify the directory is safe to use.
+    st = os.lstat(path)
+    if stat.S_ISLNK(st.st_mode) or not stat.S_ISDIR(st.st_mode):
+        raise OSError(f'Security Error: {path} is not a directory, aborted')
+    if stat.S_IMODE(st.st_mode) != 0o700:
+        raise OSError(f'Security Error: {path} has wrong permissions, aborted')
+    if st.st_uid != os.getuid():
+        raise OSError(f'Security Error: {path} does not belong to you, aborted')
+    return path
+
+
+def tempfile(appname: str, name: str = '') -> str:
+    """
+    Return the path to a file with the given name in a secure temporary
+    directory for the application.  Intermediate directories are created as
+    needed.
+    """
+    path = os.path.join(get_temp_path(appname), name)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    return path
+
+
+def daemonize(stdin: str = os.devnull, stdout: str = os.devnull, stderr: str | None = None,
+              chdir: str | None = '/') -> None:
+    """
+    Does a double-fork to daemonize the current process.  The parent process
+    exits immediately.
+    """
+    target_dir = chdir or os.getcwd()
+    if os.fork() > 0:
+        # Exit from the first parent.
+        sys.exit(0)
 
     os.chdir(target_dir)
     os.setsid()
 
-    # Second fork.
-    try:
-        pid = os.fork()
-        if pid > 0:
-            # Exit from the second parent.
-            sys.exit(0)
-    except OSError as e:
-        #log.error("Second daemonize fork failed: %d, %s\n", e.errno, e.strerror)
-        sys.exit(1)
+    if os.fork() > 0:
+        # Exit from the second parent.
+        sys.exit(0)
 
-    # Create new standard file descriptors.
-    if not stderr:
-        stderr = stdout
-    stdin = open(stdin, 'rb')
-    stdout = open(stdout, 'a+b')
-    stderr = open(stderr, 'a+b', 0)
-    if pidfile:
-        open(pidfile, 'w+b').write("%d\n" % os.getpid())
-
-    # Remap standard fds.
-    os.dup2(stdin.fileno(), sys.stdin.fileno())
-    os.dup2(stdout.fileno(), sys.stdout.fileno())
-    os.dup2(stderr.fileno(), sys.stderr.fileno())
+    # Remap standard file descriptors.
+    with open(stdin, 'rb') as fin:
+        os.dup2(fin.fileno(), sys.stdin.fileno())
+    with open(stdout, 'ab') as fout:
+        os.dup2(fout.fileno(), sys.stdout.fileno())
+    with open(stderr or stdout, 'ab', 0) as ferr:
+        os.dup2(ferr.fileno(), sys.stderr.fileno())

@@ -1,174 +1,115 @@
-# -----------------------------------------------------------------------------
-# dateutils.py - Date/time utility functions and objects.
-# -----------------------------------------------------------------------------
-# Copyright 2010-2014 Dirk Meyer, Jason Tackaberry
-#
-# Originally from kaa.base, ported to Python 3 by Jason Tackaberry
-#
-#
-# This library is free software; you can redistribute it and/or modify
-# it under the terms of the GNU Lesser General Public License version
-# 2.1 as published by the Free Software Foundation.
-#
-# This library is distributed in the hope that it will be useful, but
-# WITHOUT ANY WARRANTY; without even the implied warranty of
-# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
-# Lesser General Public License for more details.
-#
-# You should have received a copy of the GNU Lesser General Public
-# License along with this library; if not, write to the Free Software
-# Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA
-# 02110-1301 USA
-# -----------------------------------------------------------------------------
-from datetime import datetime, tzinfo, timedelta
-import email.utils
+"""
+Date and time helpers.
+"""
+from __future__ import annotations
+
+__all__ = ['from_rfc822', 'TZAny', 'TZUTC', 'TZLocal']
+
 import calendar
-import time
-
-__all__ = ['utc', 'local', 'TZAny', 'from_rfc822', 'to_timestamp', 'now', 'utcnow', 'today']
-
-
-# UTC and Local tzinfo classes, more or less from the python docs.
-
-class TZUTC(tzinfo):
-    'UTC timezone'
-    ZERO = timedelta(0)
-    tzname = lambda self, dt: 'UTC'
-    utcoffset = lambda self, dt: TZUTC.ZERO
-    dst = lambda self, dt: TZUTC.ZERO
+import email.utils
+from datetime import UTC, datetime, timedelta, timezone, tzinfo
 
 
-class TZLocal(tzinfo):
-    'DST-aware local time zone'
-    STDOFFSET = timedelta(seconds = -time.timezone)
-    DSTOFFSET = timedelta(seconds = -time.altzone) if time.daylight else timedelta(seconds = -time.timezone)
+def from_rfc822(date: str) -> datetime | None:
+    """
+    Robust parser for an RFC822 style date.
 
-    tzname = lambda self, dt: time.tzname[self._isdst(dt)]
-    utcoffset = lambda self, dt: TZLocal.DSTOFFSET if self._isdst(dt) else TZLocal.STDOFFSET
-    dst = lambda self, dt: (TZLocal.DSTOFFSET - TZLocal.STDOFFSET) if self._isdst(dt) else TZUTC.ZERO
+    Out-of-range fields (which are surprisingly common in the wild) are
+    clamped to sane values rather than rejected.
 
-    def _isdst(self, dt):
-        tt = (dt.year, dt.month, dt.day, dt.hour, dt.minute, dt.second, dt.weekday(), 0, -1)
-        return time.localtime(time.mktime(tt)).tm_isdst > 0
+    :param date: an RFC822 style date (e.g. `"Mon, 20 Nov 1995 19:12:08 -0500"`)
+    :returns: a timezone-aware datetime object, or None if the date could not
+              be parsed.  If the date has no timezone, UTC is assumed.
+    """
+    parsed = email.utils.parsedate_tz(date)
+    if not parsed:
+        return None
 
+    def clamp(val: int, minval: int, maxval: int) -> int:
+        return min(max(val, minval), maxval)
 
-# These can be used whenever tzinfo objects are required in datetime functions/methods.
-utc = TZUTC()
-local = TZLocal()
+    year = parsed[0] + 2000 if parsed[0] < 1900 else parsed[0]
+    month = clamp(parsed[1], 1, 12)
+    day = clamp(parsed[2], 1, calendar.monthrange(year, month)[1])
+    hour = clamp(parsed[3], 0, 23)
+    minute = clamp(parsed[4], 0, 59)
+    sec = clamp(parsed[5], 0, 59)
+    tzoffset = parsed[9]
+
+    if tzoffset is None:
+        return datetime(year, month, day, hour, minute, sec, tzinfo=UTC)
+    elif abs(tzoffset) >= 24 * 3600:
+        # Timezone is +/- 24h, which is not valid.  Adjust the date with the
+        # given crazy offset and treat the timezone as UTC.
+        return datetime(year, month, day, hour, minute, sec, tzinfo=UTC) + timedelta(seconds=tzoffset)
+    return datetime(year, month, day, hour, minute, sec, tzinfo=timezone(timedelta(seconds=tzoffset)))
 
 
 class TZAny(tzinfo):
     """
-    Expresses any timezone, represented as [+-]HHMM
+    A fixed-offset timezone.
+
+    .. deprecated::
+       New code uses :class:`datetime.timezone`.  This class remains only so
+       that search results pickled into existing databases by older versions
+       of Stagehand can still be loaded.
     """
-    def __init__(self, tz=None):
-        if tz is None:
-            # Special case for unpickling (see tzinfo docs)
-            self._sign = 1
-            self._hours = self._mins = 0
-        elif isinstance(tz, str):
+    def __init__(self, tz: str | float | None = None) -> None:
+        self._sign = 1
+        self._hours = self._mins = 0
+        if isinstance(tz, str):
             self._sign = -1 if tz[0] == '-' else 1
             idx = 1 if tz[0] in ('+', '-') else 0
             self._mins = int(tz[-2:])
-            self._hours = int(tz[idx:len(tz)-2])
+            self._hours = int(tz[idx:len(tz) - 2])
         elif isinstance(tz, (int, float)):
             self._sign = -1 if tz < 0 else 1
-            self._hours = abs(tz) / 3600
-            self._mins = (abs(tz) % 3600) / 60
-        else:
-            raise ValueError('tz must be +YYMM or number in seconds')
+            self._hours, rem = divmod(int(abs(tz)), 3600)
+            self._mins = rem // 60
+        elif tz is not None:
+            raise ValueError('tz must be +HHMM or number in seconds')
 
-    def __repr__(self):
-        return "<TZAny '%s'>" % self.tzname(None)
+    def __repr__(self) -> str:
+        return f"<TZAny '{self.tzname(None)}'>"
 
-    def dst(self, dt):
+    def dst(self, dt: datetime | None) -> timedelta:
         return timedelta(0)
 
-    def tzname(self, dt):
-        return '%s%02d%02d' % ('-' if self._sign < 0 else '+', self._hours, self._mins)
+    def tzname(self, dt: datetime | None) -> str:
+        return '{}{:02d}{:02d}'.format('-' if self._sign < 0 else '+', int(self._hours), int(self._mins))
 
-    def utcoffset(self, dt):
+    def utcoffset(self, dt: datetime | None) -> timedelta:
         return self._sign * timedelta(hours=self._hours, minutes=self._mins)
 
 
-def from_rfc822(date):
+class TZUTC(tzinfo):
     """
-    Robust parser for an RFC822 style date.
-
-    :param date: an RFC822 style date (e.g. `"Mon, 20 Nov 1995 19:12:08 -0500"`)
-    :type date: str
-    :returns: a timezone-aware datetime object
+    .. deprecated:: Retained for unpickling legacy data; use :data:`datetime.UTC`.
     """
-    date = email.utils.parsedate_tz(date)
-    if not date:
-        return None
+    def utcoffset(self, dt: datetime | None) -> timedelta:
+        return timedelta(0)
 
-    clamp = lambda val, minval, maxval: min(max(val, minval), maxval)
-    # Clamp all values in date to sane range.
-    date = list(date)
-    year = date[0] + 2000 if date[0] < 1900 else date[0]  # Add 2000 to year if needed
-    month = clamp(date[1], 0, 12)
-    day = clamp(date[2], 1, calendar.monthrange(date[0], date[1])[1])
-    hour = clamp(date[3], 0, 23)
-    minute = clamp(date[4], 0, 59)
-    sec = clamp(date[5], 0, 59)
-    tzoffset = date[-1]
+    def dst(self, dt: datetime | None) -> timedelta:
+        return timedelta(0)
 
-    if tzoffset is None:
-        # Timezone is missing.  Assume UTC.
-        return datetime(year, month, day, hour, minute, sec, tzinfo=utc)
-    elif abs(tzoffset) > 24*3600:
-        # Timezone is +/- 24h, which is not valid.  Adjust the date with the
-        # given crazy offset and treat the timezone as UTC.
-        dt = datetime(year, month, day, hour, minute, sec, tzinfo=utc)
-        return dt + timedelta(seconds=tzoffset)
-
-    return datetime(year, month, day, hour, minute, sec, tzinfo=TZAny(tzoffset))
+    def tzname(self, dt: datetime | None) -> str:
+        return 'UTC'
 
 
-def to_timestamp(dt):
+class TZLocal(tzinfo):
     """
-    Converts a datetime object to a timestamp (seconds since epoch).
-
-    :param dt: datetime object (naive or aware)
-    :returns: timestamp (seconds since epoch)
-
-    Native datetime objects will be treated as local time.
-
-    .. note::
-       Epoch is defined as 00:00:00 UTC on 1 January 1970.  It is *always* UTC.
+    .. deprecated:: Retained for unpickling legacy data; use ``datetime.astimezone()``.
     """
-    if dt.tzinfo is None:
-        # Treat naive objects as local time.
-        return time.mktime(dt.timetuple()) + dt.microsecond / 1000000.0
-    else:
-        return calendar.timegm(dt.utctimetuple()) + dt.microsecond / 1000000.0
+    def _local(self, dt: datetime | None) -> tzinfo:
+        tz = (dt or datetime.now()).replace(tzinfo=None).astimezone().tzinfo
+        assert tz is not None
+        return tz
 
+    def utcoffset(self, dt: datetime | None) -> timedelta | None:
+        return self._local(dt).utcoffset(dt)
 
-def now():
-    """
-    Returns the local date and time as a time-zone aware datetime object in
-    local time.
+    def dst(self, dt: datetime | None) -> timedelta | None:
+        return self._local(dt).dst(dt)
 
-    This is in contrast to the native datetime.now() which returns a naive
-    object.
-    """
-    return datetime.now(local)
-
-
-def utcnow():
-    """
-    Returns the current time as a time-zone aware datetime object in UTC.
-    """
-    return datetime.now(utc)
-
-
-def today():
-    """
-    Returns the current day at midnight as a time-zone aware datetime object
-    in local time.
-
-    This is in contrast to the native datetime.today() which does not set
-    the time to midnight and returns a naive object.
-    """
-    return now().replace(hour=0, minute=0, second=0, microsecond=0)
+    def tzname(self, dt: datetime | None) -> str | None:
+        return self._local(dt).tzname(dt)

@@ -1,123 +1,57 @@
-import os
-import time
-import hashlib
-import functools
-import mimetypes
-import itertools
-import time
-import logging
-import asyncio
+"""
+HTML page handlers.
+"""
+from __future__ import annotations
+
 from datetime import datetime, timedelta
 
+from aiohttp import web
 
-from ..toolbox.config import get_description
-
-from . import server as web
-from . import api
-from .async import asyncweb, webcoroutine
-from .settings import rename_example
-from .utils import SessionPlugin, CachePlugin, shview, static_file_from_zip, abspath_to_zippath
-from ..utils import episode_status_icon_info
-from ..coffee import cscompile_with_cache
 from ..config import config
+from ..toolbox.config import get_description
+from ..utils import episode_status_icon_info
+from .context import MANAGER, json_response, render
+from .settings import rename_example
 
-log = logging.getLogger('stagehand.web.app')
-
-web.install(SessionPlugin())
-web.install(CachePlugin())
-
-
-@web.get('/static/:filename#.*#')
-def static(filename):
-    manager = web.request['stagehand.manager']
-    root = os.path.join(manager.paths.data, 'web')
-    ziproot = abspath_to_zippath(root)
-    response = None
-
-    if ziproot:
-        try:
-            target = filename + '.compiled' if filename.endswith('.coffee') else filename
-            response = static_file_from_zip(ziproot, target)
-        except AttributeError:
-            pass
-
-    if not response:
-        # Load static file from filesystem.
-        if filename.endswith('.coffee'):
-            # This is CoffeeScript, so we need to return the compiled JavaScript
-            # instead.  Ok, not exactly static, strictly speaking. Close enough.
-            src = os.path.abspath(os.path.join(root, filename))
-            if not src.startswith(root):
-                raise web.HTTPError(403, 'Access denied.')
-            elif not os.path.exists(src):
-                # Before we give up, is there a pre-compiled version?  If not,
-                # static_file() will return a 404.
-                response = web.static_file(filename + '.compiled', root=root)
-            else:
-                cached, data = cscompile_with_cache(src, web.request['coffee.cachedir'])
-                web.response.logextra = '(CS %s)' % 'cached' if cached else 'compiled on demand'
-                web.response.content_type = 'application/javascript'
-                web.response['Cache-Control'] = 'max-age=3600'
-                return data
-        else:
-            response = web.static_file(filename, root=root)
-
-    if filename.endswith('.gz') and not isinstance(response, web.HTTPError):
-        # static_file() does the right thing with respect to Content-Type
-        # and Content-Encoding for gz files.  But if the client doesn't have
-        # gzip in Accept-Encoding, we need to decompress it on the fly.
-        if 'gzip' not in web.request.headers.get('Accept-Encoding', ''):
-            import gzip
-            response.body = gzip.GzipFile(fileobj=response.body)
-    #elif filename.endswith('.coffee'):
-    #    response['X-SourceMap'] = '/static/' + filename + '.map'
-    return response
+routes = web.RouteTableDef()
 
 
-@web.get('/')
-@shview('home.tmpl')
-def home():
-    return {}
+def page(path: str, template: str) -> None:
+    """
+    Registers a handler for a page that needs no context beyond the defaults.
+    """
+    async def handler(request: web.Request) -> web.Response:
+        return render(request, template)
+    handler.__name__ = template.replace('/', '_').removesuffix('.tmpl')
+    routes.get(path)(handler)
 
 
+page('/', 'home.tmpl')
+page('/tv/', 'tv/library.tmpl')
+page('/tv/add', 'tv/add.tmpl')
+page('/tv/upcoming', 'tv/upcoming.tmpl')
+page('/settings/searchers', 'settings/searchers.tmpl')
+page('/settings/retrievers', 'settings/retrievers.tmpl')
+page('/settings/notifiers', 'settings/notifiers.tmpl')
+page('/log/', 'log/application.tmpl')
+page('/log/web', 'log/web.tmpl')
 
-@web.get('/tv/')
-@shview('tv/library.tmpl')
-def tv_library():
-    return {}
 
-@web.get('/tv/<id>', method='GET')
-@shview('tv/show.tmpl')
-def tv_show(id):
-    tvdb = web.request['stagehand.manager'].tvdb
-    series = tvdb.get_series_by_id(id)
+@routes.get('/tv/{id}')
+async def tv_show(request: web.Request) -> web.Response:
+    tvdb = request.app[MANAGER].tvdb
+    series = tvdb.get_series_by_id(request.match_info['id'])
     if not series:
-        raise web.HTTPError(404, 'Invalid show.')
-    return {
-        'series': series,
-        'providers': tvdb.providers.values()
-    }
+        raise web.HTTPNotFound(text='Invalid show.')
+    return render(request, 'tv/show.tmpl', {'series': series, 'providers': tvdb.providers.values()})
 
 
-@web.get('/tv/add', method='GET')
-@shview('tv/add.tmpl')
-def tv_add():
-    return {}
-
-
-@web.get('/tv/upcoming')
-@shview('tv/upcoming.tmpl')
-def tv_upcoming():
-    return {}
-
-
-
-@web.get('/downloads/')
-@shview('downloads/downloads.tmpl')
-def downloads():
-    manager = web.request['stagehand.manager']
-    weeks = int(web.request.query.weeks) if web.request.query.weeks.isdigit() else 1
-    status = web.request.query.status or 'have'
+@routes.get('/downloads/')
+async def downloads(request: web.Request) -> web.Response:
+    manager = request.app[MANAGER]
+    weeks_arg = request.query.get('weeks', '')
+    weeks = int(weeks_arg) if weeks_arg.isdigit() else 1
+    status = request.query.get('status') or 'have'
 
     # Construct a list of episodes, sorted by air date, that are either needed
     # or match the criteria for inclusion (based on status and weeks).  Episodes
@@ -127,13 +61,14 @@ def downloads():
     sunday = today if today.weekday() == 6 else today - timedelta(days=today.weekday() + 1)
     episodes = []
     for s in manager.tvdb.series:
+        if s.cfg.paused:
+            # Don't show episodes for paused series, even if they are needed.
+            continue
         for ep in s.episodes:
             if ep.status != ep.STATUS_NEED_FORCED and (not ep.aired or manager.is_episode_queued_for_retrieval(ep)):
                 continue
-            if s.cfg.paused:
-                # Don't show episodes for paused series, even if they are needed.
-                continue
             icon, title = episode_status_icon_info(ep)
+            week: int | None
             if ep.airdate:
                 # week 0 is anything on or after sunday
                 week = (max(0, (sunday - ep.airdate).days) + 6) // 7
@@ -146,53 +81,20 @@ def downloads():
     # For episodes without an airdate, just use 1900-01-01 for sorting
     # purposes, so they sorted last.
     episodes.sort(key=lambda i: (i[0].airdatetime or datetime(1900, 1, 1), i[0].name), reverse=True)
-    return {
-        'weeks': weeks,
-        'status': status,
-        'episodes': episodes
-    }
+    return render(request, 'downloads/downloads.tmpl', {'weeks': weeks, 'status': status, 'episodes': episodes})
 
 
-@web.get('/settings/')
-@shview('settings/general.tmpl')
-def settings_general():
-    return {
+@routes.get('/settings/')
+async def settings_general(request: web.Request) -> web.Response:
+    return render(request, 'settings/general.tmpl', {
         'desc': lambda x: get_description(x).replace('\n\n', '<br/><br/>'),
-        'rename_example':
-            rename_example(config.misc.tvdir, config.naming.separator, config.naming.season_dir_format,
-                           config.naming.code_style, config.naming.episode_format)
-    }
-
-@web.get('/settings/rename_example')
-def settings_rename_example():
-    q = web.request.query
-    return rename_example(config.misc.tvdir, q.separator, q.season_dir_format,
-                          q.code_style, q.episode_format)
+        'rename_example': rename_example(config.misc.tvdir, config.naming.separator, config.naming.season_dir_format,
+                                         config.naming.code_style, config.naming.episode_format),
+    })
 
 
-@web.get('/settings/searchers')
-@shview('settings/searchers.tmpl')
-def settings_searchers():
-    return {}
-
-@web.get('/settings/retrievers')
-@shview('settings/retrievers.tmpl')
-def settings_retrievers():
-    return {}
-
-@web.get('/settings/notifiers')
-@shview('settings/notifiers.tmpl')
-def settings_notifiers():
-    return {}
-
-
-
-@web.get('/log/')
-@shview('log/application.tmpl')
-def log_application():
-    return {}
-
-@web.get('/log/web')
-@shview('log/web.tmpl')
-def log_web():
-    return {}
+@routes.get('/settings/rename_example')
+async def settings_rename_example(request: web.Request) -> web.Response:
+    q = request.query
+    return json_response(rename_example(config.misc.tvdir, q.get('separator', ''), q.get('season_dir_format', ''),
+                                        q.get('code_style', ''), q.get('episode_format', '')))

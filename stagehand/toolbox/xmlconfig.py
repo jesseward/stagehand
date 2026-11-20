@@ -1,12 +1,9 @@
 # -----------------------------------------------------------------------------
-# xmlconfig.py - xml config to python converter
+# xmlconfig.py - build config schemas from cxml files
 # -----------------------------------------------------------------------------
-# Copyright 2006-2014 Jason Tackaberry, Dirk Meyer
+# Copyright 2006-2014 Dirk Meyer, Jason Tackaberry
 #
 # Originally from kaa.base, ported to Python 3 by Jason Tackaberry
-#
-#
-# Please see the file AUTHORS for a complete list of authors.
 #
 # This library is free software; you can redistribute it and/or modify
 # it under the terms of the GNU Lesser General Public License version
@@ -22,24 +19,39 @@
 # Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA
 # 02110-1301 USA
 # -----------------------------------------------------------------------------
-__all__ = [ 'convert' ]
+"""
+Builds :class:`~stagehand.toolbox.config.Config` objects from XML schema
+(``.cxml``) files.
 
-import sys
-import pprint
-import os
-from io import StringIO
+Older versions generated Python modules from these files at build time.
+The schema is now loaded at import time, so the package works directly from
+a source checkout.
+"""
+from __future__ import annotations
+
+__all__ = ['load', 'from_string']
+
+import importlib.resources
+from typing import Any
 from xml.dom import minidom
+from xml.dom.minidom import Element
 
-def get_value(value, type):
+from .config import Base, Config, Dict, Group, List, Var
+
+_TYPES: dict[str, type] = {'str': str, 'unicode': str, 'int': int, 'float': float, 'bool': bool, 'bytes': bytes}
+
+
+def _get_value(value: str, type: str | None) -> Any:
+    """
+    Converts the string value from the XML into a Python value, either of the
+    given type, or inferred from the value itself.
+    """
     if type:
         if type == 'bool':
-            return {'1': True, 'true': True}.get(value.lower(), False)
-        if sys.hexversion >= 0x03000000:
-            if type in ('unicode'):
-                return str(value) if value else str()
-            elif type == 'bytes':
-                return bytes(value, 'ascii') if value else bytes()
-        return eval(type)(value) if value else eval(type)()
+            return value.lower() in ('1', 'true')
+        if type == 'bytes':
+            return value.encode('ascii')
+        return _TYPES[type](value) if value else _TYPES[type]()
     if value.lower() == 'true':
         return True
     if value.lower() == 'false':
@@ -48,198 +60,106 @@ def get_value(value, type):
         return int(value)
     if value.replace('.', '').isdigit() and value.count('.') == 1:
         return float(value)
-    return str(value)
+    return value
 
 
-def format_content(node):
-    # Get the raw xml of all children for the node.  This allows markup
-    # (like HTML) to be used inside, for example, description elements.
+def _format_content(node: Element) -> str:
+    """
+    Returns the raw XML of all children of the node, dedented.  This allows
+    markup (like HTML) to be used inside description elements.
+    """
     s = ''.join(c.toxml() for c in node.childNodes).replace('\t', '        ')
     spaces = ''
     while s:
         if s[0] == ' ':
             spaces += ' '
             s = s[1:]
-            continue
-        if s[0] == '\n':
+        elif s[0] == '\n':
             spaces = ''
             s = s[1:]
-            continue
-        break
+        else:
+            break
     return s.replace('\n' + spaces, '\n').strip()
 
 
-def nodefilter(node, *names):
-    return [ n for n in node.childNodes if n.nodeName in names ]
+def _children(node: Element, *names: str) -> list[Element]:
+    return [n for n in node.childNodes if isinstance(n, Element) and n.nodeName in names]
 
 
-class Parser:
-
-    def __init__(self, package):
-        self._package = package
-
-    def _get_schema(self, node):
-        schema = []
-        for child in node.childNodes:
-            if hasattr(self, '_parse_%s' % child.nodeName):
-                schema.append(child)
-        return schema
+_SCHEMA_NODES = ('var', 'group', 'list', 'dict')
 
 
-    def parse(self, node, fd, deep=''):
-        fd.write('%s(' % node.nodeName.capitalize())
-        first = True
-        if node.getAttribute('name'):
-            fd.write('name=\'%s\'' % node.getAttribute('name'))
-            first = False
-        for child in nodefilter(node, 'desc'):
-            if not first:
-                fd.write(', ')
-            first = False
-            desc = format_content(child).replace('\'', '\\\'')
-            if desc.find('\n') > 0:
-                desc = deep + desc.replace('\n', '\n' + deep)
-                fd.write('desc=\'\'\'\n%s\n%s\'\'\'' % (desc, deep))
-            else:
-                fd.write('desc=\'%s\'' % desc)
+def _build(node: Element, module: str | None = None) -> Base:
+    kwargs: dict[str, Any] = {}
+    if node.getAttribute('name'):
+        kwargs['name'] = node.getAttribute('name')
+    for desc in _children(node, 'desc'):
+        kwargs['desc'] = _format_content(desc)
 
-        defaults = {}
-        for child in nodefilter(node, 'defaults'):
-            for default in nodefilter(child, 'default'):
-                platform = default.getAttribute('platform')
-                value = ''.join(c.toxml() for c in default.childNodes)
-                defaults[platform] = value
+    kind = node.nodeName
+    if kind == 'var':
+        defaults: dict[str, str] = {}
+        for container in _children(node, 'defaults'):
+            for default in _children(container, 'default'):
+                defaults[default.getAttribute('platform')] = ''.join(c.toxml() for c in default.childNodes)
         if defaults:
-            if not first:
-                fd.write(', ')
-            fd.write('defaults={}'.format(repr(defaults)))
+            kwargs['defaults'] = defaults
 
-        getattr(self, '_parse_%s' % node.nodeName.lower())(node, fd, deep, first, defaults)
-
-
-    def _parse_var(self, node, fd, deep, first, defaults_list):
-        default = node.getAttribute('default')
-        deftype = node.getAttribute('type')
-        scramblekey = node.getAttribute('scramblekey')
-        if default or (deftype and not defaults_list):
-            if not first:
-                fd.write(', ')
-            first = False
-            default = get_value(default, deftype)
-            fd.write('default=%s' % pprint.pformat(default).strip())
-        if scramblekey:
-            if not first:
-                fd.write(', ')
-            fd.write("scramblekey='{}'".format(scramblekey))
-            first=False
-
-        for child in nodefilter(node, 'enum') or nodefilter(node, 'values'):
-            if not first:
-                fd.write(', ')
-            first = False
+        default_value = node.getAttribute('default')
+        vartype = node.getAttribute('type')
+        if default_value or (vartype and not defaults):
+            kwargs['default'] = _get_value(default_value, vartype)
+        if node.getAttribute('scramblekey'):
+            kwargs['scramblekey'] = node.getAttribute('scramblekey')
+        for enum in _children(node, 'enum', 'values')[:1]:
             values = []
-            for value in nodefilter(child, 'value'):
-                content = value.childNodes[0].data
-                values.append(get_value(content, value.getAttribute('type')))
-            fd.write('type=%s' % pprint.pformat(tuple(values)).strip())
-            break
-        fd.write(')')
+            for value in _children(enum, 'value'):
+                text = value.firstChild
+                assert isinstance(text, minidom.Text)
+                values.append(_get_value(text.data, value.getAttribute('type')))
+            kwargs['type'] = tuple(values)
+        return Var(**kwargs)
+
+    schema = [_build(child) for child in _children(node, *_SCHEMA_NODES)]
+    if kind == 'config':
+        return Config(schema=schema, module=module, **kwargs)
+    elif kind == 'group':
+        return Group(schema=schema, **kwargs)
+
+    # list or dict
+    container_defaults = {s.getAttribute('key'): _get_value(s.getAttribute('value'), None)
+                          for s in _children(node, 'set')}
+    if container_defaults:
+        kwargs['defaults'] = container_defaults
+    child_schema: Any = schema[0] if len(schema) == 1 else schema
+    if kind == 'dict':
+        if node.getAttribute('type'):
+            kwargs['type'] = _TYPES[node.getAttribute('type')]
+        return Dict(schema=child_schema, **kwargs)
+    return List(schema=child_schema, **kwargs)
 
 
-    def _parse_config(self, node, fd, deep, first, defaults):
-        self._parse_group(node, fd, deep, first, defaults)
-
-
-    def _parse_group(self, node, fd, deep, first, defaults):
-        if not first:
-            fd.write(', ')
-        deep = deep + '  '
-        fd.write('schema=[\n\n' + deep)
-        for s in self._get_schema(node):
-            self.parse(s, fd, deep)
-            fd.write(',\n\n' + deep)
-        deep = deep[:-2]
-        fd.write(']\n' + deep)
-        if node.nodeName == 'config' and self._package:
-            fd.write(", module='%s.config'" % self._package)
-        fd.write(')')
-
-
-    def _parse_list(self, node, fd, deep, first, defaults):
-        if not first:
-            fd.write(', ')
-        schema = self._get_schema(node)
-        fd.write('schema=')
-        if len(schema) > 1:
-            deep = deep + '  '
-            fd.write('[\n\n' + deep)
-        for s in schema:
-            self.parse(s, fd, deep)
-            if len(schema) > 1:
-                fd.write(',\n\n' + deep)
-        if len(schema) > 1:
-            deep = deep[:-2]
-            fd.write(']\n' + deep)
-        type = node.getAttribute('type')
-        if type and node.nodeName == 'dict':
-            fd.write(', type=%s' % type)
-        defaults = {}
-        for var in nodefilter(node, 'set'):
-            value = get_value(var.getAttribute('value'), None)
-            defaults[var.getAttribute('key')] = value
-        if defaults:
-            fd.write(', defaults=%s' % pprint.pformat(defaults).strip())
-
-        fd.write(')')
-
-
-    def _parse_dict(self, node, fd, deep, first, defaults):
-        self._parse_list(node, fd, deep, first, defaults)
-
-
-def _convert(xml, out, package, cfgmodule):
-    tree = minidom.parseString(xml).firstChild
-    if tree.nodeName != 'config':
-        raise RuntimeError('%s is no valid cxml file' % xml)
-
-    out.write('# auto generated file\n\n')
-    out.write('from {} import Var, Group, Dict, List, Config\n\n'.format(cfgmodule))
-    out.write('config = ')
-
-    Parser(package).parse(tree, out)
-    out.write('\n\n')
-    for child in tree.childNodes:
-        if child.nodeName != 'code':
-            continue
-        out.write(format_content(child) + '\n\n')
-
-
-def convert(infile, outfile, package, cfgmodule='config'):
+def from_string(xml: str, module: str | None = None) -> Config:
     """
-    Converts the xml contained in infile to the Python code stored in outfile.
+    Returns a Config object built from the given cxml string.
+
+    :param module: the name of the module the config belongs to, which is
+                   recorded in the header of saved config files
     """
-    out = open(outfile, 'w')
-    try:
-        _convert(open(infile).read(), out, package, cfgmodule)
-        out.close()
-    except RuntimeError:
-        os.unlink(outfile)
+    tree = minidom.parseString(xml).documentElement
+    if tree is None or tree.nodeName != 'config':
+        raise ValueError('not a valid cxml document (root element must be <config>)')
+    config = _build(tree, module)
+    assert isinstance(config, Config)
+    return config
 
 
-def to_code(xml, package=None, cfgmodule='config'):
+def load(package: str, resource: str, module: str | None = None) -> Config:
     """
-    Returns python code from the xml in the given string.
-    """
-    out = StringIO()
-    _convert(xml, out, package, cfgmodule)
-    return out.getvalue()
+    Returns a Config object built from a cxml file shipped inside a package.
 
-
-def to_object(xml, package=None, cfgmodule='config'):
+    :param package: the package containing the cxml file (e.g. ``stagehand``)
+    :param resource: the file name of the cxml (e.g. ``config.cxml``)
     """
-    Returns a Config object generated from the given xml string.
-    """
-    code = to_code(xml, package, cfgmodule)
-    scope = {}
-    eval(compile(code, 'foo', 'exec'), scope, scope)
-    return scope['config']
+    xml = importlib.resources.files(package).joinpath(resource).read_text(encoding='utf-8')
+    return from_string(xml, module)

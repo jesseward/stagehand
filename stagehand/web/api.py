@@ -1,174 +1,175 @@
+"""
+JSON API handlers used by the web client.
+"""
+from __future__ import annotations
+
+import html
+import logging
+import mimetypes
 import os
 import time
-import mimetypes
-import time
-import logging
-import asyncio
+from typing import Any
 
-from . import server as web
-from .async import asyncweb, webcoroutine
+from aiohttp import web
+
+from ..tvdb import Episode, Series
 from ..utils import episode_status_icon_info
-from ..tvdb import Episode
+from .context import MANAGER, SHUTDOWN, json_response
+from .jobs import AsyncWebJob, webcoroutine
 
-log = logging.getLogger('stagehand.web.app')
+log = logging.getLogger('stagehand.web.api')
 
-def get_series_from_request(id):
-    series = web.request['stagehand.manager'].tvdb.get_series_by_id(id)
+routes = web.RouteTableDef()
+
+
+def get_series(request: web.Request, id: str) -> Series:
+    series = request.app[MANAGER].tvdb.get_series_by_id(id)
     if not series:
-        raise web.HTTPError(404, 'Invalid show.')
+        raise web.HTTPNotFound(text='Invalid show.')
     return series
 
 
-@web.put('/api/shows/<id>')
+# Note: the literal routes below must be registered before /api/shows/{id}
+# routes with the same shape.
+
+@routes.get('/api/shows/search')
+@webcoroutine(interval=500)
+async def show_search(request: web.Request, job: AsyncWebJob) -> dict[str, Any]:
+    t0 = time.perf_counter()
+    results = await request.app[MANAGER].tvdb.search(request.query.get('name', ''))
+    job.notify('alert', title='Search results', text=f'Search took {time.perf_counter() - t0:.3f}s')
+    return {'results': [{
+        'id': r.id,
+        'name': r.name,
+        'overview': r.overview,
+        'year': r.year,
+        'imdb': r.imdb,
+        'provider': r.provider.NAME,
+        'started': r.started,
+    } for r in results]}
+
+
+@routes.get('/api/shows/check')
+@webcoroutine(interval=500)
+async def show_check(request: web.Request, job: AsyncWebJob) -> dict[str, int]:
+    id = request.query.get('id')
+    only = [get_series(request, id)] if id else None
+    need, found = await request.app[MANAGER].check_new_episodes(only=only)
+    return {'need': sum(len(eps) for eps in need.values()), 'found': len(found)}
+
+
+@routes.put('/api/shows/{id}')
 @webcoroutine()
-def show_add(job, id):
-    manager = web.request['stagehand.manager']
+async def show_add(request: web.Request, job: AsyncWebJob, id: str) -> dict[str, Any]:
     job.notify('alert', title='Adding series', text='Retrieving episode information for this series ...')
     try:
-        series = yield from manager.add_series(id)
+        series = await request.app[MANAGER].add_series(id)
+        if not series:
+            raise LookupError(f'No series found for {id}')
     except Exception as e:
         log.exception('failed to add series')
         job.notify_after('alert', title='Failed to add series', text=str(e), timeout=2)
     else:
-        job.notify_after('alert', title='Series added', text='Added series %s to database.' % series.name, timeout=2)
+        job.notify_after('alert', title='Series added', text=f'Added series {series.name} to database.', timeout=2)
     return {}
 
 
-@web.delete('/api/shows/<id>')
+@routes.delete('/api/shows/{id}')
 @webcoroutine()
-def show_delete(job, id):
-    manager = web.request['stagehand.manager']
-    name = get_series_from_request(id).name
-    manager.delete_series(id)
+async def show_delete(request: web.Request, job: AsyncWebJob, id: str) -> dict[str, Any]:
+    name = get_series(request, id).name
+    request.app[MANAGER].delete_series(id)
     # Notify the session about the removal, but do it via a timer so that
     # the notification happens on the next page load rather than in response
     # to the API call.
-    job.notify_after('alert', title='Series Deleted', text='Series <b>%s</b> was removed from the database' % name)
+    job.notify_after('alert', title='Series Deleted', html=f'Series <b>{html.escape(name)}</b> was removed from the database')
     return {}
 
 
-@web.get('/api/shows/<id>/banner', cache=3600*24*7)
-def show_banner(id):
-    # TODO: support cache check
-    series = get_series_from_request(id)
+@routes.get('/api/shows/{id}/banner')
+async def show_banner(request: web.Request) -> web.Response:
+    series = get_series(request, request.match_info['id'])
     if not series.banner_data:
-        raise web.HTTPError(404, 'Invalid show, or no banner for this show.')
-
-    web.response['Content-Length'] = len(series.banner_data)
-    mimetype, encoding = mimetypes.guess_type(series.banner)
-    if mimetype:
-        web.response.content_type = mimetype
-    return series.banner_data
+        raise web.HTTPNotFound(text='Invalid show, or no banner for this show.')
+    mimetype, _ = mimetypes.guess_type(series.banner or '')
+    return web.Response(body=series.banner_data, content_type=mimetype or 'application/octet-stream',
+                        headers={'Cache-Control': f'max-age={3600 * 24 * 7}'})
 
 
-@web.post('/api/shows/<id>/provider')
+@routes.post('/api/shows/{id}/provider')
 @webcoroutine()
-def show_provider(job, id):
-    series = get_series_from_request(id)
-    provider = web.request.forms.get('provider')
+async def show_provider(request: web.Request, job: AsyncWebJob, id: str) -> None:
+    series = get_series(request, id)
+    provider = (await request.post()).get('provider')
     if provider:
         try:
-            yield from series.change_provider(provider)
+            await series.change_provider(str(provider))
         except Exception as e:
-            job.notify_after('alert', title='Series Provider', text='Failed to change provider: %s' % e.args[0])
-            raise web.HTTPError(404, 'Invalid provider.')
-        else:
-            series.cfg.provider = provider
+            job.notify_after('alert', title='Series Provider', text=f'Failed to change provider: {e}')
+            raise web.HTTPNotFound(text='Invalid provider.') from e
+        series.cfg.provider = str(provider)
 
 
-@web.post('/api/shows/<id>/refresh')
+@routes.post('/api/shows/{id}/refresh')
 @webcoroutine()
-def show_refresh(job, id):
-    series = get_series_from_request(id)
-    yield from series.refresh()
+async def show_refresh(request: web.Request, job: AsyncWebJob, id: str) -> None:
+    await get_series(request, id).refresh()
 
 
-@web.post('/api/shows/<id>/settings')
-def show_settings(id):
-    series = get_series_from_request(id)
-    settings = web.request.forms
-    series.cfg.quality = settings.quality
-    series.cfg.path = settings.path
-    series.cfg.search_string = settings.search_string
-    series.cfg.language = settings.language
-    #series.cfg.upgrade = True if settings['upgrade'] == 'true' else False
-    series.cfg.paused = True if settings['paused'] == 'true' else False
-    series.cfg.flat = True if settings['flat'] == 'true' else False
-    series.cfg.identifier = settings.identifier
+@routes.post('/api/shows/{id}/settings')
+async def show_settings(request: web.Request) -> web.Response:
+    series = get_series(request, request.match_info['id'])
+    settings = await request.post()
 
+    def get(name: str) -> str:
+        return str(settings.get(name, ''))
+
+    series.cfg.quality = get('quality')
+    series.cfg.path = get('path')
+    series.cfg.search_string = get('search_string')
+    series.cfg.language = get('language')
+    series.cfg.paused = get('paused') == 'true'
+    series.cfg.flat = get('flat') == 'true'
+    series.cfg.identifier = get('identifier')
     # TODO: if pausing a series that has queued episodes, remove them and
     # notify user.
+    return json_response({})
 
 
-@web.get('/api/shows/<id>/overview')
-def show_overview(id):
-    series = get_series_from_request(id)
-    return {'overview': series.overview}
+@routes.get('/api/shows/{id}/overview')
+async def show_overview(request: web.Request) -> web.Response:
+    series = get_series(request, request.match_info['id'])
+    return json_response({'overview': series.overview})
 
 
-@web.get('/api/shows/<id>/<code>/overview')
-def show_episode_overview(id, code):
-    series = get_series_from_request(id)
-    ep = series.get_episode_by_code(code)
-    return {'overview': ep.overview if ep else 'Episode not found'}
+@routes.get('/api/shows/{id}/{code}/overview')
+async def show_episode_overview(request: web.Request) -> web.Response:
+    series = get_series(request, request.match_info['id'])
+    ep = series.get_episode_by_code(request.match_info['code'])
+    return json_response({'overview': ep.overview if ep else 'Episode not found'})
 
 
-@web.get('/api/shows/search')
-@webcoroutine(interval=500)
-def show_search(job):
-    q = web.request.query
-    manager = web.request['stagehand.manager']
-
-    t0 = time.time()
-    results = yield from manager.tvdb.search(q.name)
-    job.notify('alert', title='Search results', text='Search took %.3fs' % (time.time() - t0))
-    # JSONify the SearchResult objects
-    dictlist = []
-    for r in results:
-        dictlist.append({
-            'id': r.id,
-            'name': r.name,
-            'overview': r.overview,
-            'year': r.year,
-            'imdb': r.imdb,
-            'provider': r.provider.NAME,
-            'started': r.started
-        })
-    return {'results': dictlist}
+STATUS_ACTIONS = {
+    'need': Episode.STATUS_NEED,
+    'ignore': Episode.STATUS_IGNORE,
+    'delete': Episode.STATUS_IGNORE,
+}
 
 
-@web.get('/api/shows/check')
-@webcoroutine(interval=500)
-def show_check(job):
-    manager = web.request['stagehand.manager']
-    if web.request.query.id:
-        only = [get_series_from_request(web.request.query.id)]
-    else:
-        only = []
-
-    need, found = yield from manager.check_new_episodes(only=only)
-    return {'need': sum(len(eps) for eps in need.values()), 'found': len(found)}
-
-
-@web.post('/api/shows/<id>/episodes/<epcode>/status')
+@routes.post('/api/shows/{id}/episodes/{epcode}/status')
 @webcoroutine()
-def show_episodes_status(job, id, epcode):
-    manager = web.request['stagehand.manager']
-    series = get_series_from_request(id)
+async def show_episodes_status(request: web.Request, job: AsyncWebJob, id: str, epcode: str) -> dict[str, Any]:
+    manager = request.app[MANAGER]
+    series = get_series(request, id)
     eps = [series.get_episode_by_code(code) for code in epcode.split(',')]
     if None in eps:
-        raise web.HTTPError(404, 'Unknown episode for this show.')
+        raise web.HTTPNotFound(text='Unknown episode for this show.')
 
-    action = web.request.query.value
-    status_map = {
-        'need': Episode.STATUS_NEED,
-        'ignore': Episode.STATUS_IGNORE,
-        'delete': Episode.STATUS_IGNORE
-    }
+    action = request.query.get('value', '')
     try:
-        status_val = status_map[action]
+        status_val = STATUS_ACTIONS[action]
     except KeyError:
-        raise web.HTTPError(404, 'Invalid status code.')
+        raise web.HTTPNotFound(text='Invalid status code.') from None
 
     statuses = {}
     do_check_new_episodes = False
@@ -195,27 +196,26 @@ def show_episodes_status(job, id, epcode):
             try:
                 os.unlink(ep.path)
             except OSError as e:
-                job.notify('alert', title='Delete Episode', text='Failed to delete %s: %s' % (ep.path, e), type='error')
+                job.notify('alert', title='Delete Episode', text=f'Failed to delete {ep.path}: {e}', type='error')
             else:
-                job.notify('alert', title='Delete Episode', text='%s deleted' % ep.filename)
+                job.notify('alert', title='Delete Episode', text=f'{ep.filename} deleted')
                 ep.filename = None
 
         statuses[ep.code] = episode_status_icon_info(ep)
 
     if do_check_new_episodes:
-        asyncio.async(manager.check_new_episodes(), loop=manager.loop)
+        # Runs in the background (singleton task).
+        manager.check_new_episodes()
     return {'statuses': statuses}
 
 
-@web.get('/api/restart')
-def restart():
-    web.restart()
+@routes.get('/api/shutdown')
+async def shutdown(request: web.Request) -> web.Response:
+    log.warning('shutdown requested via web API')
+    request.app[SHUTDOWN].set()
+    return json_response({})
 
 
-@web.get('/api/shutdown')
-def shutdown():
-    asyncio.get_event_loop().stop()
-
-@web.get('/api/pid')
-def pid():
-    return {'pid': os.getpid()}
+@routes.get('/api/pid')
+async def pid(request: web.Request) -> web.Response:
+    return json_response({'pid': os.getpid()})

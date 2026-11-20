@@ -22,19 +22,20 @@
 # Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA
 # 02110-1301 USA
 # -----------------------------------------------------------------------------
-import os
-import struct
-import logging
-import select
-import errno
-import socket
-import string
-import itertools
-import ctypes, ctypes.util
 import asyncio
+import ctypes
+import ctypes.util
+import errno
+import fcntl
+import itertools
+import logging
+import os
+import select
+import string
+import struct
 
-from .core import Signals, Signal
-from .utils import *
+from .core import Signal, Signals
+from .utils import fsname, tobytes
 
 log = logging.getLogger('toolbox.inotify')
 
@@ -87,7 +88,7 @@ class INotify:
         :returns: a string in the form EVENT1 | EVENT2 | EVENT3 ...
         """
         events = []
-        for attr in itertools(['CHANGE'], INotify.__dict__.keys()):
+        for attr in itertools.chain(['CHANGE'], INotify.__dict__.keys()):
             if attr == 'WATCH_MASK' or attr[0] not in string.ascii_uppercase:
                 continue
             event = getattr(INotify, attr)
@@ -99,9 +100,9 @@ class INotify:
 
     def __init__(self):
         super().__init__()
-        self._fd = 0
+        self._fd = -1
+        self._loop = asyncio.get_running_loop()
         try:
-            import fcntl
             self._libc = ctypes.CDLL(ctypes.util.find_library("c"))
             # System libc supports INotify, so setup args/restypes for INotify calls.
             self._libc.inotify_init.restype = ctypes.c_int
@@ -110,7 +111,7 @@ class INotify:
             self._libc.inotify_add_watch.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_uint32]
             self._libc.inotify_rm_watch.restype = ctypes.c_int
             self._libc.inotify_rm_watch.argtypes = [ctypes.c_int, ctypes.c_int]
-        except (TypeError, AttributeError, ImportError):
+        except (TypeError, AttributeError, OSError):
             # We could use syscall() as a fallback (which used to be the case
             # when we used a C module instead of ctypes), but is it worth it?
             raise OSError(errno.ENOSYS, 'INotify not available on platform')
@@ -133,13 +134,26 @@ class INotify:
             raise OSError(errno.ENOSYS, 'INotify support not detected on this system.')
 
         fcntl.fcntl(self._fd, fcntl.F_SETFL, os.O_NONBLOCK)
-        asyncio.get_event_loop().add_reader(self._fd, self._handle_data)
+        self._loop.add_reader(self._fd, self._handle_data)
+
+
+    def close(self):
+        """
+        Removes all watches and releases the inotify file descriptor.
+        """
+        if self._fd >= 0:
+            if not self._loop.is_closed():
+                self._loop.remove_reader(self._fd)
+            os.close(self._fd)
+            self._fd = -1
+        self._stop_moved_timer()
 
 
     def __del__(self):
-        if os and self._fd >= 0:
-            asyncio.get_event_loop().remove_reader(self._fd)
-            os.close(self._fd)
+        try:
+            self.close()
+        except Exception:
+            pass
 
 
     def watch(self, path, mask=None):
@@ -168,12 +182,12 @@ class INotify:
         if path in self._watches_by_path:
             return self._watches_by_path[path][0]
 
-        if mask == None:
+        if mask is None:
             mask = INotify.WATCH_MASK
 
         wd = self._libc.inotify_add_watch(self._fd, tobytes(path, fs=True), mask)
         if wd < 0:
-            raise IOError('Failed to add watch on "%s"' % path)
+            raise OSError(f'Failed to add watch on "{path}"')
 
         signal = Signal()
         self._watches[wd] = [signal, path]
@@ -221,7 +235,7 @@ class INotify:
 
         :returns: list of strings
         """
-        return self._watches_by_path.keys()
+        return list(self._watches_by_path.keys())
 
 
     def _emit_last_move(self):
@@ -247,7 +261,7 @@ class INotify:
     def _handle_data(self):
         try:
             self._read_buffer += os.read(self._fd, 32768)
-        except (OSError, IOError, socket.error) as e:
+        except OSError as e:
             if e.errno == errno.EAGAIN:
                 # select(2) man page tells us that on Linux, there may be
                 # "circumstances in which a file descriptor is spuriously
@@ -265,7 +279,7 @@ class INotify:
                     # MOVED_TO.  If we don't get a matching MOVED_TO in 0.1
                     # seconds, emit the MOVED_FROM event.
                     self._stop_moved_timer()
-                    self._moved_timer = asyncio.get_event_loop().call_later(0.1, self._emit_last_move)
+                    self._moved_timer = self._loop.call_later(0.1, self._emit_last_move)
                 break
 
             wd, mask, cookie, size = struct.unpack("IIII", self._read_buffer[0:event_len])

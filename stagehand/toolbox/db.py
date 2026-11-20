@@ -31,23 +31,33 @@ __all__ = [
 ]
 
 # python imports
-import sys
-import os
-import time
-import re
+import asyncio
+import copyreg
+import functools
+import io
 import logging
 import math
-import copyreg
+import os
 import pickle
-import struct
-import _weakref
-import threading
-import functools
-import string
+import re
 import sqlite3 as sqlite
+import threading
+import time
+import weakref
+from typing import Any
 
-import asyncio
 from .utils import tostr
+
+
+def _call_later(delay, callback):
+    """
+    Schedules a callback on the running loop, or returns None if there is no
+    running loop.
+    """
+    try:
+        return asyncio.get_running_loop().call_later(delay, callback)
+    except RuntimeError:
+        return None
 
 RAW_TYPE = bytes
 BYTES_TYPE = bytes
@@ -130,8 +140,23 @@ def btos(s):
 def dbpickle(value):
     return bytes(pickle.dumps(value, 3))
 
+class _ModMapUnpickler(pickle.Unpickler):
+    """
+    Unpickler that can remap module names, so that objects pickled by older
+    versions (where classes lived in different modules) can still be loaded.
+    """
+    def __init__(self, file, modmap):
+        super().__init__(file)
+        self._modmap = modmap
+
+    def find_class(self, module, name):
+        return super().find_class(self._modmap.get(module, module), name)
+
+
 def dbunpickle(s, modmap=None):
-    return pickle.loads(bytes(s))
+    if not modmap:
+        return pickle.loads(bytes(s))
+    return _ModMapUnpickler(io.BytesIO(bytes(s)), modmap).load()
 
 
 class PyObjectRow:
@@ -152,7 +177,7 @@ class PyObjectRow:
     # query references the same data.  Each ObjectRow instance adds to the
     # refcount once initialized, and is decremented when the object is deleted.
     # Once it reaches 0, the entry is removed from the dict.
-    queries = {}
+    queries: dict[Any, Any] = {}
     # Use __slots__ as a minor optimization to improve object creation time.
     __slots__ = ('_description', '_object_types', '_type_name', '_row', '_pickle',
                 '_idxmap', '_typemap', '_keys', '_modmap')
@@ -284,12 +309,7 @@ class PyObjectRow:
             else:
                 value = self._pickle[key]
 
-        if sys.hexversion < 0x03000000 and (attr[3] == str or attr[3] == buffer):
-            # Python 2's pysqlite returns BLOBs as buffers.  If the attribute
-            # type is string or buffer (RAW_TYPE on Python 2), convert to string.
-            return str(value)
-        else:
-            return value
+        return value
 
 
     def keys(self):
@@ -340,18 +360,7 @@ class PyObjectRow:
             return key in self._idxmap
 
 
-try:
-    #from . import _objectrow
-    import _objectrow
-except ImportError:
-    # Use the python-native ObjectRow
-    ObjectRow = PyObjectRow
-else:
-    # Use the faster C-based ObjectRow
-    ObjectRow = _objectrow.ObjectRow
-    # Expose the custom unpickler to the _objectrow module so it can deal with
-    # pickles stored inside DB rows.
-    _objectrow.dbunpickle = dbunpickle
+ObjectRow = PyObjectRow
 
 
 # Register a handler for pickling ObjectRow objects.
@@ -479,11 +488,10 @@ class RegexpCache:
         if self.last_item == item and self.last_item is not None and self.last_expr == expr:
             return self.last_result
         if self.last_expr != expr:
-            self.last_expr = re.compile(unicode(expr), re.U)
+            self.last_expr = re.compile(str(expr))
 
         self.last_item = item
-        # FIXME: bad conversion to unicode!
-        self.last_result = self.last_expr.match(unicode(item)) is not None
+        self.last_result = self.last_expr.match(str(item)) is not None
         return self.last_result
 
 
@@ -495,7 +503,7 @@ class Database:
     ATTR_INVERTED_INDEX = ATTR_INVERTED_INDEX
     ATTR_INDEXED_IGNORE_CASE = ATTR_INDEXED_IGNORE_CASE
 
-    def __init__(self, dbfile, modmap=None, *, loop=None):
+    def __init__(self, dbfile, modmap=None):
         """
         Open a database, creating one if it doesn't already exist.
 
@@ -504,8 +512,7 @@ class Database:
 
         SQLite is used to provide the underlying database.
         """
-        super(Database, self).__init__()
-        self._loop = loop or asyncio.get_event_loop()
+        super().__init__()
         self._modmap = modmap
         # _object_types dict is keyed on type name, where value is a 3-
         # tuple (id, attrs, idx), where:
@@ -551,7 +558,7 @@ class Database:
         self._cursor = self._db.cursor()
 
         class Cursor(sqlite.Cursor):
-            _db = _weakref.ref(self)
+            _db = weakref.ref(self)
         self._db.row_factory = ObjectRow
         # Queries done through this cursor will use the ObjectRow row factory.
         self._qcursor = self._db.cursor(Cursor)
@@ -579,7 +586,7 @@ class Database:
         if self._lazy_commit_interval is not None:
             if self._lazy_commit_timer:
                 self._lazy_commit_timer.cancel()
-            self._lazy_commit_timer = self._loop.call_later(self._lazy_commit_interval, self.commit)
+            self._lazy_commit_timer = _call_later(self._lazy_commit_interval, self.commit)
         if self._dirty:
             return
         self._dirty = True
@@ -587,7 +594,6 @@ class Database:
 
 
     def _db_query(self, statement, args = (), cursor = None, many = False):
-        t0=time.time()
         with self._lock:
             if not cursor:
                 cursor = self._cursor
@@ -596,8 +602,6 @@ class Database:
             else:
                 cursor.execute(statement, args)
             rows = cursor.fetchall()
-        t1=time.time()
-        #log.warn('db: query [%.06f]: %s (%s)', t1-t0, statement, args)
         return rows
 
 
@@ -909,7 +913,7 @@ class Database:
 
         # Iterate through type attributes and append to SQL create statement.
         sql_types = {int: 'INTEGER', float: 'FLOAT', bytes: 'BLOB',
-                     str: 'TEXT', bool: 'INTEGER', str: 'TEXT'}
+                     str: 'TEXT', bool: 'INTEGER'}
         for attr_name, (attr_type, attr_flags, attr_ivtidx, attr_split) in attrs.items():
             if attr_flags & ATTR_SEARCHABLE:
                 # Attribute needs to be a column in the table, not a pickled value.
@@ -1030,7 +1034,7 @@ class Database:
         if split is None:
             # Default split regexp is to split words on
             # alphanumeric/digits/underscore boundaries.
-            split = re.compile(u"(\d+)|[_\W]", re.U)
+            split = re.compile(r"(\d+)|[_\W]")
         elif isinstance(split, str):
             split = re.compile(tostr(split), re.U)
 
@@ -1094,7 +1098,7 @@ class Database:
             self._object_types[name] = id, attrs, idx
 
 
-        if sys.hexversion >= 0x03000000 and is_pickle_proto_2:
+        if is_pickle_proto_2:
             self._readonly = True
             log.warning('databases created by Python 2 are read-only until upgrade_to_py3() is called')
 
@@ -1133,9 +1137,10 @@ class Database:
                 if key in self._inverted_indexes:
                     continue
                 raise ValueError("Reference to undefined attribute '%s' for type '%s'" % (key, type_name))
-            if attrs[key] == None:
-                # Remove all None attributes (even ATTR_SEARCHABLE), otherwise we will
-                # raise a TypeError later, since NoneType isn't the right type.
+            if attrs[key] is None:
+                if type_attrs[key][1] & ATTR_SEARCHABLE:
+                    # Searchable attributes are columns, which are set to NULL.
+                    continue
                 if type_attrs[key][1] & ATTR_SIMPLE:
                     # Attribute removed from a pickle, be sure we update the pickle in
                     # the db if this is an 'update' query_type.
@@ -1148,6 +1153,11 @@ class Database:
                 columns.append(name)
                 placeholders.append("?")
                 value = attrs[name]
+                if value is None:
+                    values.append(None)
+                    del attrs_copy[name]
+                    attrs_copy.pop('__' + name, None)
+                    continue
                 # Coercion for numeric types
                 if isinstance(value, (int, float)) and attr_type in (int, float):
                     value = attr_type(value)
@@ -1613,10 +1623,26 @@ class Database:
         .. note:: Any uncommitted changes will automatically be committed at
                   program exit.
         """
-        #main.signals['exit'].disconnect(self.commit)
+        if self._lazy_commit_timer:
+            self._lazy_commit_timer.cancel()
+            self._lazy_commit_timer = None
         self._dirty = False
         with self._lock:
             self._db.commit()
+
+
+    def close(self):
+        """
+        Commit any pending changes and close the database.  The Database
+        object must not be used afterward.
+        """
+        if self._db is None:
+            return
+        self.commit()
+        with self._lock:
+            self._cursor.close()
+            self._db.close()
+            self._db = None
 
 
     def query(self, **attrs):
@@ -2520,11 +2546,12 @@ class Database:
 
     @lazy_commit.setter
     def lazy_commit(self, value):
-        self._lazy_commit_interval = float(value)
+        self._lazy_commit_interval = float(value) if value else None
         if self._lazy_commit_timer:
             self._lazy_commit_timer.cancel()
-        if value and self._dirty:
-            self._lazy_commit_timer = self._loop.call_later(self._lazy_commit_interval, self.commit)
+            self._lazy_commit_timer = None
+        if self._lazy_commit_interval and self._dirty:
+            self._lazy_commit_timer = _call_later(self._lazy_commit_interval, self.commit)
 
 
     @property

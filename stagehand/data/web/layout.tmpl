@@ -1,0 +1,102 @@
+<!DOCTYPE html>
+<html lang='en'>
+<head>
+    <meta charset='utf-8' />
+    <meta name='viewport' content='width=device-width, initial-scale=1' />
+    <title>{{title}} | Stagehand</title>
+    <link rel="shortcut icon" href="{{root}}/static/img/favicon.ico" />
+    <link rel='stylesheet' href='{{root}}/static/css/stagehand.css' />
+    <script src='{{root}}/static/js/stagehand.js'></script>
+    %if defined('header'):
+        %header()
+    %end
+</head>
+<body>
+    <script>
+const stagehand = new Stagehand('{{root}}');
+</script>
+
+    <div id='banner'>
+        <img style='position: absolute; left: 272px; top: 10px; opacity: 1.5' src='{{root}}/static/img/masks.png' alt='' />
+        <div id='logo'></div>
+        <a id='progress' href='{{root}}/downloads/' title='View active downloads' hidden>
+            <span></span>
+        </a>
+        <div id='menubar'>
+            <ul class='menu' id='main'>
+                <li id='m-home'><a href='{{root}}/'><img src='{{root}}/static/img/home.png' alt='Home' /></a></li>
+                <li id='m-tv'><a href='{{root}}/tv/'>TV Shows</a></li>
+                <li id='m-downloads'><a href='{{root}}/downloads/'>Downloads</a></li>
+                %if False:
+                <li id='m-settings'><a href='{{root}}/settings/'>Settings</a></li>
+                <li id='m-log'><a href='{{root}}/log/'>Log</a></li>
+                %end
+                <li>
+                    %import stagehand
+                    version {{stagehand.__version__}}
+                </li>
+            </ul>
+            <ul class='menu submenu {{'shown' if section == 'home' else ''}}' id='submenu-home' style='background-color: white'>
+                <li style='visibility: hidden'><a href='{{root}}/'>Padding Placeholder</a></li>
+            </ul>
+            <ul class='menu submenu {{'shown' if section == 'tv' else ''}}' id='submenu-tv'>
+                <li id='m-tv-library'><a href='{{root}}/tv/'>Library</a></li>
+                <li id='m-tv-upcoming'><a href='{{root}}/tv/upcoming'>Upcoming Episodes</a></li>
+            </ul>
+
+            <ul class='menu submenu {{'shown' if section == 'downloads' else ''}}' id='submenu-downloads' style='background-color: white'>
+                <li style='visibility: hidden'><a href='{{root}}/'>Padding Placeholder</a></li>
+            </ul>
+
+            <ul class='menu submenu {{'shown' if section == 'settings' else ''}}' id='submenu-settings'>
+                <li id='m-settings-general'><a href='{{root}}/settings/'>General</a></li>
+                <li id='m-settings-searchers'><a href='{{root}}/settings/searchers'>Searchers</a></li>
+                <li id='m-settings-retrievers'><a href='{{root}}/settings/retrievers'>Retrievers</a></li>
+                <li id='m-settings-notifiers'><a href='{{root}}/settings/notifiers'>Notifiers</a></li>
+            </ul>
+
+            <ul class='menu submenu {{'shown' if section == 'log' else ''}}' id='submenu-log'>
+                <li id='m-log-application'><a href='{{root}}/log/'>Application</a></li>
+                <li id='m-log-web'><a href='{{root}}/log/web'>Web</a></li>
+            </ul>
+            <div style='clear: both'></div>
+        </div>
+    </div>
+
+<script>
+{
+    $('#m-{{section}}')?.classList.add('active');
+    $('#m-{{section}}-{{subsection}}')?.classList.add('active');
+
+    // Show the submenu for the hovered menu item, reverting to the current
+    // section's submenu when the mouse leaves the menu bar.
+    const showSubmenu = name => {
+        const menu = $(`#submenu-${name}`);
+        if (menu) {
+            $$('.submenu').forEach(m => m.classList.remove('shown'));
+            menu.classList.add('shown');
+        }
+    };
+    for (const item of $$('#main li[id]')) {
+        item.addEventListener('mouseenter', () => showSubmenu(item.id.replace('m-', '')));
+    }
+    $('#menubar').addEventListener('mouseleave', () => showSubmenu('{{section}}'));
+
+    // Download progress indicator in the banner.
+    stagehand.on('dlprogress', ({ queue }) => {
+        const indicator = $('#banner #progress');
+        const progress = queue[0]?.[2];
+        indicator.hidden = !progress;
+        if (progress) {
+            $('span', indicator).style.width = `${progress[0]}%`;
+        }
+    });
+
+    stagehand.handleResponse({{!json(pending_jobs)}});
+}
+</script>
+
+    {{!base}}
+
+</body>
+</html>

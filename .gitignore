@@ -1,9 +1,12 @@
-*.pyc
 *.swp
 build/
 dist/
 local/
-src/__init__.py
-stagehand.egg-info/
 ChangeLog
-MANIFEST
+__pycache__/
+*.egg-info/
+.coverage
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+.venv/

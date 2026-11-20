@@ -27,19 +27,37 @@ __all__ = [ 'Var', 'Group', 'Dict', 'List', 'Config', 'set_default',
             'DELETED', 'DEFAULT' ]
 
 # Python imports
+import asyncio
+import base64
+import functools
+import hashlib
+import importlib
+import itertools
+import logging
 import os
 import re
-import logging
 import stat
-import hashlib
-import itertools
-import base64
+import sys
 import textwrap
-import asyncio
 
-from .utils import *
 from .core import Signals
 from .inotify import INotify
+from .utils import get_encoding, tobytes, tostr
+
+# Hashes are used for change detection, not security.
+_md5 = functools.partial(hashlib.md5, usedforsecurity=False)
+
+
+def _call_later(delay, callback, *args):
+    """
+    Schedules a callback on the running loop, or returns None if there is no
+    running loop (e.g. config is being manipulated before startup).
+    """
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return None
+    return loop.call_later(delay, callback, *args)
 
 # get logging object
 log = logging.getLogger('config')
@@ -118,7 +136,7 @@ class Base:
                          expression tested against *sys.platform*.  If there is
                          no match then the *default* kwarg is used instead.
         """
-        super(Base, self).__init__()
+        super().__init__()
         self._parent = None
         # This name is not authoritative, but rather is the name we should have
         # in our parent's namespace once added.  For variables under a
@@ -140,12 +158,12 @@ class Base:
         ideas of what the proper value should be.  Subclasses must also handle the
         copy-on-write case.
         """
-        raise NotImplemented
+        raise NotImplementedError
 
 
     @_value.setter
     def _value(self, value):
-        raise NotImplemented
+        raise NotImplementedError
 
 
     @property
@@ -166,7 +184,7 @@ class Base:
         a hash of the schema only.
         """
         value = repr(self._stored_value) if values else ''
-        return hashlib.md5(tobytes(repr(self._desc) + repr(self._default) + value)).hexdigest()
+        return _md5(tobytes(repr(self._desc) + repr(self._default) + value)).hexdigest()
 
 
     def copy(self, copy_on_write=False):
@@ -205,9 +223,7 @@ class Base:
         self._monitors.append(callback)
 
     def remove_monitor(self, callback):
-        for monitor in self._monitors:
-            if callback == monitor:
-                self._monitors.remove(monitor)
+        self._monitors[:] = [m for m in self._monitors if m != callback]
 
     def _notify_monitors(self, oldval, newval):
         o = self
@@ -379,7 +395,7 @@ class Var(Base):
 
 
     def copy(self, copy_on_write=False):
-        copy = super(Var, self).copy(copy_on_write)
+        copy = super().copy(copy_on_write)
         copy._type = self._type
         copy._scramblekey = self._scramblekey
         # Access self value through the property so we get the true value
@@ -392,8 +408,8 @@ class Var(Base):
         """
         Returns a hash of the config item.
         """
-        hashdata = super(Var, self)._hash(values) + repr(self._type) + (self._scramblekey or '')
-        return hashlib.md5(tobytes(hashdata)).hexdigest()
+        hashdata = super()._hash(values) + repr(self._type) + (self._scramblekey or '')
+        return _md5(tobytes(hashdata)).hexdigest()
 
     def __eq__(self, value):
         return self._value == value
@@ -446,10 +462,10 @@ class Var(Base):
             return
 
         if isinstance(self._type, (list, tuple)):
-            if not value in self._type:
+            if value not in self._type:
                 # This could crash, but that is ok
                 value = self._type[0].__class__(value)
-            if not value in self._type:
+            if value not in self._type:
                 allowed = [ str(x) for x in self._type ]
                 raise TypeError('Variable must be one of %s' % ', '.join(allowed))
         elif not isinstance(value, self._type):
@@ -552,7 +568,7 @@ class Group(Base):
         """
         Returns a hash of the config item.
         """
-        hash = hashlib.md5(tobytes(super()._hash(values)))
+        hash = _md5(tobytes(super()._hash(values)))
         for name in self._vars:
             hash.update(tobytes(name + self._dict[name]._hash(values)))
         return hash.hexdigest()
@@ -707,11 +723,11 @@ class Container(Base):
         Subclasses must implement this.  Does a deep copy of all children from
         source (or _cow_source if source is None) and reparents them.
         """
-        raise NotImplemented
+        raise NotImplementedError
 
 
     def copy(self, copy_on_write=False):
-        copy = super(Container, self).copy(copy_on_write)
+        copy = super().copy(copy_on_write)
         copy._schema = self._schema.copy()
         copy._type = self._type
         if not copy_on_write:
@@ -757,7 +773,7 @@ class Container(Base):
             self._cfg_set_item(index, value)
 
 
-    def __nonzero__(self):
+    def __bool__(self):
         """
         Return False if there are no elements in the dict.
         """
@@ -775,7 +791,7 @@ class Container(Base):
         """
         Returns a hash of the config item.
         """
-        hash = hashlib.md5(tobytes(super(Container, self)._hash(values)))
+        hash = _md5(tobytes(super()._hash(values)))
         for name, var in self._vars():
             hash.update(tobytes(repr(name) + var._hash(values)))
         return hash.hexdigest()
@@ -814,7 +830,7 @@ class Container(Base):
                     replace.first = False
                     return ret
                 replace.first = True
-                cfgstr = re.sub(re.compile('^%s\[\d+\]' % re.escape(fqn), re.M), replace, cfgstr)
+                cfgstr = re.sub(re.compile(r'^%s\[\d+\]' % re.escape(fqn), re.M), replace, cfgstr)
 
             var_strings.append(cfgstr)
             if '\n' in cfgstr:
@@ -941,7 +957,7 @@ class Dict(Container):
         if self._cow_source is not None:
             self._copy_children()
 
-        if isinstance(dict, Dist):
+        if isinstance(dict, Dict):
             dict = dict._dict
 
         if self._dict is not dict:
@@ -1136,11 +1152,11 @@ class Config(Group):
         """
         Returns a hash of the config item.
         """
-        return hashlib.md5(tobytes(super(Config, self)._hash(values) + repr(self._bad_lines))).hexdigest()
+        return _md5(tobytes(super()._hash(values) + repr(self._bad_lines))).hexdigest()
 
 
     def copy(self, copy_on_write=False):
-        copy = super(Config, self).copy(copy_on_write)
+        copy = super().copy(copy_on_write)
         for attr in ('_bad_lines', '_loaded_hash_values', '_loaded_hash_schema', '_module', '_autosave'):
             setattr(copy, attr, getattr(self, attr))
         copy._autosave = None
@@ -1307,8 +1323,8 @@ class Config(Group):
                     obj = getattr(obj, key)
             return obj
 
-        line_regexp = re.compile('^([a-zA-Z0-9_-]+|\[.*?\]|\.)+ *= *(.*)')
-        key_regexp = re.compile('(([a-zA-Z0-9_-]+)|(\[.*?\]))')
+        line_regexp = re.compile(r'^([a-zA-Z0-9_-]+|\[.*?\]|\.)+ *= *(.*)')
+        key_regexp = re.compile(r'(([a-zA-Z0-9_-]+)|(\[.*?\]))')
 
         self._loaded_hash_schema = None
         self._loaded_hash_values = None
@@ -1323,8 +1339,9 @@ class Config(Group):
         autosave_orig = self.autosave
         self.autosave = False
 
-        f = open(filename)
-        for line in f.readlines():
+        with open(filename) as f:
+            lines = f.readlines()
+        for line in lines:
             line = line.strip()
             # convert lines based on local encoding
             line = tostr(line, local_encoding)
@@ -1351,7 +1368,7 @@ class Config(Group):
             m = line_regexp.match(line.strip())
             if not m:
                 error = ('Unable to parse the line', line.encode(local_encoding))
-                if not error in self._bad_lines:
+                if error not in self._bad_lines:
                     log.warning('%s: %s' % error)
                     self._bad_lines.append(error)
                 continue
@@ -1387,10 +1404,9 @@ class Config(Group):
                     setattr(obj, key, value)
             except Exception as e:
                 error = tostr(e), line
-                if not error in self._bad_lines:
+                if error not in self._bad_lines:
                     log.warning('%s: %s' % error)
                     self._bad_lines.append(error)
-        f.close()
 
         # TODO: now that we know which list indexes / dict keys have been
         # assigned in the config file (via container_indexes), we need to walk
@@ -1443,7 +1459,7 @@ class Config(Group):
 
             self._stop_autosave_timer()
             # Start/restart the timer to save in 5 seconds.
-            self._autosave_timer = asyncio.get_event_loop().call_later(5, self.save)
+            self._autosave_timer = _call_later(5, self.save)
 
 
     def watch(self, watch=True):
@@ -1457,10 +1473,11 @@ class Config(Group):
         if watch and not self._inotify:
             try:
                 self._inotify = INotify()
-            except OSError:
+            except (OSError, RuntimeError):
+                # INotify unavailable on this platform, or no running loop.
                 pass
 
-        assert(self.filename)
+        assert self.filename
         if self._watch_mtime == 0:
             self.load()
 
@@ -1479,7 +1496,7 @@ class Config(Group):
                     raise OSError
             except OSError:
                 # Adding watch failed, use timer to wait for file to appear.
-                self._watch_timer = asyncio.get_event_loop().call_later(3, self._check_file_changed)
+                self._watch_timer = _call_later(3, self._check_file_changed)
             self._watching = True
 
 
@@ -1497,7 +1514,7 @@ class Config(Group):
             self.watch()
 
         if self._watch_timer:
-            self._watch_timer = asyncio.get_event_loop().call_later(3, self._check_file_changed)
+            self._watch_timer = _call_later(3, self._check_file_changed)
 
         if mtime != self._watch_mtime:
             return self._file_changed(INotify.MODIFY, self.filename, None)
@@ -1526,9 +1543,9 @@ class Config(Group):
             self.remove_monitor(cb)
         elif mask & (INotify.IGNORED | INotify.MOVE_SELF):
             # File may have been replaced, check mtime now.
-            asyncio.get_event_loop().call_later(0.1, self._check_file_changed)
+            _call_later(0.1, self._check_file_changed)
             # Add a slower timer in case it doesn't reappear right away.
-            self._watch_timer = asyncio.get_event_loop().call_later(3, self._check_file_changed)
+            self._watch_timer = _call_later(3, self._check_file_changed)
 
 
 def set_default(var, value):
@@ -1628,7 +1645,8 @@ def get_config(filename, module = None):
 
     if not module:
         # No module specified, check the config file.
-        metadata = file(filename).read(256)
+        with open(filename) as f:
+            metadata = f.read(256)
         m = re.search(r'^# -\*- module: (\S+) -\*-$', metadata, re.M)
         if m:
             module = m.group(1)
@@ -1639,10 +1657,10 @@ def get_config(filename, module = None):
     attr = components.pop()
     module = '.'.join(components)
     try:
-        exec('import %s as module' % module)
+        module = importlib.import_module(module)
     except Exception as e:
         log.exception('config loader')
-        raise ImportError('Could not import config module %s' % module)
+        raise ImportError(f'Could not import config module {module}') from e
 
     config = getattr(module, attr)
     if config.filename and os.path.realpath(config.filename) != os.path.realpath(filename):

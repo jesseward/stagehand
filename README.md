@@ -16,7 +16,7 @@ Here are some of the main features:
 * ~~Pretty, modern-looking UI~~ (Well it was 10 years ago.)
 * Support for multiple TV metadata providers (currently TheTVDB and TVmaze): easily choose the authoritative provider per-series
 * (Exclusive) support for Easynews HTTP-based global search
-* Multi-platform: tested on Linux and Windows (and theoretically works on OS X)
+* Runs in Docker, or anywhere with Python 3.15 (Linux and macOS; Windows is no longer supported)
 
 ## What it isn't
 
@@ -39,37 +39,49 @@ The core of Stagehand is quite robust, but many essential features are missing:
 
 ## How to run it
 
-Stagehand is powered by Python and requires a Python version between 3.3 and 3.6.
-
-This max Python version restriction is obviously problematic, but fixing it requires
-nontrivial changes.  Consequently, we use a Docker image to ensure compatibility.
-
-The Docker image is available at
-[`jtackaberry/stagehand`](https://hub.docker.com/r/jtackaberry/stagehand).  This is the
-simplest way to run it -- change `/data/tv` below with the path where you want to hold
-downloaded episodes:
+The simplest way is Docker.  Change `/data/tv` below to the path where you want
+to hold downloaded episodes:
 
 ```bash
-docker run -ti -u $UID:$UID --net=host -v $HOME:/stagehand -v /data/tv:/stagehand/tv jtackaberry/stagehand
+docker build --build-arg VERSION=$(git describe --tags) -t stagehand .
+docker run -d --name stagehand -u $(id -u):$(id -g) --net=host \
+    -v $HOME:/stagehand -v /data/tv:/stagehand/tv stagehand
+docker logs -f stagehand
 ```
 
 If things are working properly, you should see output that looks like this:
 
 ```
-2022-05-20 20:11:38,655 [INFO] stagehand: starting Stagehand 0.3.3
-2022-05-20 20:11:38,662 [INFO] manager: watching /stagehand/.config/stagehand/config for changes
-2022-05-20 20:11:38,680 [INFO] manager: scheduling next episode check for 2022-05-20 21:06:00
-2022-05-20 20:11:38,682 [INFO] manager: checking for new episodes and availability
-2022-05-20 20:11:38,692 [INFO] manager: no new episodes; we are all up to date
-2022-05-20 20:11:38,696 [INFO] stagehand.web: started webserver at http://faith:8088/
-2022-05-20 20:11:38,697 [INFO] manager: checking all epsiodes to see if any need resuming
-2022-05-20 20:11:38,697 [INFO] manager: stagehand started, waiting for next new episodes check
+2026-11-20 04:27:26,640 [INFO] stagehand: starting Stagehand 0.4.0
+2026-11-20 04:27:26,641 [INFO] manager: watching /stagehand/.config/stagehand/config for changes
+2026-11-20 04:27:26,642 [INFO] web: started webserver at http://myhost:8088/
+2026-11-20 04:27:26,643 [INFO] manager: scheduling next episode check for 2026-11-20 05:06:00
+2026-11-20 04:27:26,644 [INFO] manager: no new episodes; we are all up to date
+2026-11-20 04:27:26,644 [INFO] manager: stagehand started, waiting for next new episodes check
 ```
 
 Note the webserver URL in the output above.  You should be able to browse to this URL from
 within your network.  Before proceeding with configuration, ensure that it's reachable.
 
-👉 You can daemonize the container by replacing `-ti` in the command line above with `-d`.
+The image includes `ffprobe` (from [FFmpeg](https://ffmpeg.org/)), which Stagehand uses
+to verify downloads while they're in progress (resolution, duration and audio language),
+aborting ones that don't meet a series' requirements.  Add `--build-arg FFMPEG=0` to build
+a much smaller image without it, in which case downloads aren't verified.
+
+Logs are written to `~/.cache/stagehand/logs/`, and the config file and database live in
+`~/.config/stagehand/` (inside the volume mounted at `/stagehand`).  Send `SIGHUP` to reload
+the config (`docker kill -s HUP stagehand`), or `SIGUSR1` to force a refresh of TV metadata.
+
+### Without Docker
+
+Stagehand requires Python 3.15.  Install it as a command line tool with
+[uv](https://docs.astral.sh/uv/) or [pipx](https://pipx.pypa.io/), and optionally install
+FFmpeg for download verification:
+
+```bash
+uv tool install git+https://github.com/jtackaberry/stagehand
+stagehand            # -b to run in the background, --stop to stop it, -v for more logging
+```
 
 
 ## How to configure it
@@ -89,3 +101,24 @@ searchers.easynews.password = your_easynews_password
 
 Once you save the config file, you're ready to start using Stagehand.  No reload
 is needed, it will pick up the changes dynamically.
+
+
+## Development
+
+```bash
+uv venv -p 3.15 && uv pip install -e '.[dev,browser]'
+playwright install chromium              # for the browser tests (skipped if not installed)
+pytest                                   # run the test suite
+ruff check stagehand tests               # lint
+mypy stagehand                           # type check
+python -m stagehand -vv                  # run from the source tree (templates reload on change)
+```
+
+The web interface is served by [aiohttp](https://docs.aiohttp.org/), with
+pages rendered from Bottle `SimpleTemplate` templates in
+`stagehand/data/web/`.  The client side is plain JavaScript and CSS with no
+libraries (`js/stagehand.js`, `css/stagehand.css`); `tests/test_browser.py`
+drives it with Playwright.  Everything is `asyncio`-based; long-running API calls
+are run as background jobs that the browser polls (see `stagehand/web/jobs.py`).
+
+See [CHANGELOG.md](CHANGELOG.md) for what changed in the move to modern Python.
